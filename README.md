@@ -2,8 +2,8 @@
 
 A Rust library for reading and writing PostgreSQL dump files.
 
-Currently supports the **custom format** (`pg_dump -Fc`), with planned
-support for tar and directory formats.
+Supports all three pg_dump formats: **custom** (`-Fc`), **directory** (`-Fd`),
+and **tar** (`-Ft`).
 
 ## Usage
 
@@ -11,7 +11,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-libpgdump = "0.1"
+libpgdump = "1"
 ```
 
 ### Load an existing dump
@@ -101,7 +101,7 @@ match libpgdump::load("backup.dump") {
 
 ## Supported features
 
-- **Read/write** custom format (`-Fc`) archives
+- **Read/write** custom (`-Fc`), directory (`-Fd`), and tar (`-Ft`) archives
 - **Compression**: none, gzip, lz4, and zstd
 - **Archive versions** 1.12.0 through 1.16.0 (PostgreSQL 9.0–18)
 - **Version-aware parsing**: handles all format variations across versions
@@ -109,16 +109,21 @@ match libpgdump::load("backup.dump") {
 - **Large object (blob) support**
 - **Programmatic dump creation**: build dumps from scratch with the builder API
 
-## Archive format reference
+## Format details
 
-The custom format is a binary archive containing:
+`Dump::load()` auto-detects the format from file type (directory) or magic bytes (`PGDMP` = custom, `ustar` = tar).
 
-| Component | Description |
-| --------- | ----------- |
-| Header | Magic bytes (`PGDMP`), version, sizes, format, compression |
-| Metadata | Timestamp, database name, server version, pg_dump version |
-| TOC | Table of contents with entry definitions and dependencies |
-| Data blocks | Compressed or uncompressed table data and large objects |
+### Custom format (`-Fc`)
+
+Binary archive: header with magic bytes, version, and compression info; metadata (timestamp, database name, versions); TOC with entry definitions and dependencies; compressed or uncompressed data blocks.
+
+### Directory format (`-Fd`)
+
+A directory containing `toc.dat` (binary TOC in custom format) and per-entry `.dat` data files. Supports all compression algorithms.
+
+### Tar format (`-Ft`)
+
+A standard tar archive containing `toc.dat` and per-entry data files. Does not support compression.
 
 ## Minimum Rust version
 
