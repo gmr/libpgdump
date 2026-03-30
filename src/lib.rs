@@ -6,6 +6,7 @@ pub mod error;
 pub mod format;
 pub mod header;
 pub mod io;
+mod sort;
 pub mod types;
 pub mod version;
 

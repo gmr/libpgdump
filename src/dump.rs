@@ -10,6 +10,7 @@ use crate::format::custom::{self, ArchiveData, Blob, Timestamp};
 use crate::format::directory;
 use crate::format::tar;
 use crate::header::Header;
+use crate::sort;
 use crate::types::{CompressionAlgorithm, Format, OffsetState};
 use crate::version::{self, ArchiveVersion};
 
@@ -180,6 +181,9 @@ impl Dump {
 
     fn to_archive_data(&self) -> ArchiveData {
         let mut entries = self.entries.clone();
+
+        // Sort entries using weighted topological sort (matching pg_dump)
+        sort::sort_entries(&mut entries);
 
         // For directory and tar formats, ensure entries have filenames
         if self.header.format == Format::Directory || self.header.format == Format::Tar {
@@ -404,6 +408,19 @@ impl Dump {
     /// Set compression algorithm for writing.
     pub fn set_compression(&mut self, alg: CompressionAlgorithm) {
         self.header.compression = alg;
+    }
+
+    /// Sort TOC entries using the same weighted topological sort as pg_dump.
+    ///
+    /// Entries are first sorted by object-type priority (schema before table,
+    /// table before index, etc.), then by namespace and name.  A topological
+    /// sort pass then reorders only as needed to satisfy the dependency graph,
+    /// preserving the cosmetic ordering wherever possible.
+    ///
+    /// This is called automatically by [`Dump::save`], but can also be called
+    /// manually if you need the sorted order before writing.
+    pub fn sort_entries(&mut self) {
+        sort::sort_entries(&mut self.entries);
     }
 }
 
