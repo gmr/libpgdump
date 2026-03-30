@@ -25,6 +25,13 @@ pub struct Timestamp {
     pub is_dst: i32,
 }
 
+/// A single large object (blob) with its OID and decompressed content.
+#[derive(Debug, Clone)]
+pub struct Blob {
+    pub oid: i32,
+    pub data: Vec<u8>,
+}
+
 /// Read result containing all parsed archive data.
 #[derive(Debug)]
 pub struct ArchiveData {
@@ -34,8 +41,10 @@ pub struct ArchiveData {
     pub server_version: String,
     pub dump_version: String,
     pub entries: Vec<Entry>,
-    /// Map of dump_id -> raw (decompressed) data bytes.
+    /// Map of dump_id -> raw (decompressed) data bytes for TABLE DATA entries.
     pub data: HashMap<i32, Vec<u8>>,
+    /// Map of dump_id -> list of blobs for BLOBS entries.
+    pub blobs: HashMap<i32, Vec<Blob>>,
 }
 
 /// Read a custom format archive from a reader.
@@ -63,7 +72,7 @@ pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
     }
 
     // Read data blocks by seeking to each entry's offset
-    let data = read_data_blocks(r, &header, &entries)?;
+    let (data, blobs) = read_data_blocks(r, &header, &entries)?;
 
     Ok(ArchiveData {
         header,
@@ -73,6 +82,7 @@ pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
         dump_version,
         entries,
         data,
+        blobs,
     })
 }
 
@@ -271,12 +281,17 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
 }
 
 /// Read all data blocks from the archive, decompressing them.
+///
+/// Returns (table_data, blobs) where table_data maps dump_id to decompressed
+/// bytes and blobs maps dump_id to a list of individual large objects.
+#[allow(clippy::type_complexity)]
 fn read_data_blocks<R: Read + Seek>(
     r: &mut R,
     header: &Header,
     entries: &[Entry],
-) -> Result<HashMap<i32, Vec<u8>>> {
+) -> Result<(HashMap<i32, Vec<u8>>, HashMap<i32, Vec<Blob>>)> {
     let mut data_map: HashMap<i32, Vec<u8>> = HashMap::new();
+    let mut blob_map: HashMap<i32, Vec<Blob>> = HashMap::new();
 
     for entry in entries {
         if entry.data_state != OffsetState::Set || !entry.had_dumper {
@@ -298,57 +313,37 @@ fn read_data_blocks<R: Read + Seek>(
             )));
         }
 
-        // Read data based on block type
-        let raw_data = match block_type {
-            BlockType::Blobs => read_blob_data(r, header)?,
-            BlockType::Data => read_compressed_data(r, header)?,
-        };
-        data_map.insert(entry.dump_id, raw_data);
+        match block_type {
+            BlockType::Blobs => {
+                blob_map.insert(entry.dump_id, read_blob_data(r, header)?);
+            }
+            BlockType::Data => {
+                data_map.insert(entry.dump_id, read_compressed_data(r, header)?);
+            }
+        }
     }
 
-    Ok(data_map)
+    Ok((data_map, blob_map))
 }
 
 /// Read blob data from a BLK_BLOBS block.
 ///
 /// Structure: oid(int) compressed_chunks oid(int) compressed_chunks ... 0(int)
 /// Each blob's data is preceded by its OID. A zero OID terminates the sequence.
-fn read_blob_data<R: Read + Seek>(r: &mut R, header: &Header) -> Result<Vec<u8>> {
-    // Capture the raw bytes of the blob block (everything between the block header
-    // and the terminating zero OID) so we can round-trip them faithfully when writing
-    // as BLK_BLOBS.
-    let start = r.stream_position()?;
+/// Returns individual (oid, decompressed_data) pairs.
+fn read_blob_data<R: Read>(r: &mut R, header: &Header) -> Result<Vec<Blob>> {
+    let mut blobs = Vec::new();
 
-    // Skip past all blobs to find the end
     loop {
         let oid = read_int(r, header.int_size)?;
         if oid == 0 {
             break;
         }
-        // Skip compressed chunks for this blob
-        loop {
-            let chunk_size = read_int(r, header.int_size)?;
-            if chunk_size == 0 {
-                break;
-            }
-            if chunk_size < 0 {
-                return Err(Error::DataIntegrity(format!(
-                    "negative chunk size: {chunk_size}"
-                )));
-            }
-            r.seek(SeekFrom::Current(chunk_size as i64))?;
-        }
+        let data = read_compressed_data(r, header)?;
+        blobs.push(Blob { oid, data });
     }
 
-    let end = r.stream_position()?;
-    let len = (end - start) as usize;
-
-    // Seek back and read the raw bytes
-    r.seek(SeekFrom::Start(start))?;
-    let mut raw = vec![0u8; len];
-    r.read_exact(&mut raw)?;
-
-    Ok(raw)
+    Ok(blobs)
 }
 
 /// Read and decompress a sequence of data chunks.
@@ -415,18 +410,15 @@ pub fn write_archive<W: std::io::Write + Seek>(w: &mut W, archive: &ArchiveData)
     // Write data blocks and record actual offsets
     let mut actual_offsets: HashMap<i32, u64> = HashMap::new();
     for entry in &archive.entries {
-        if let Some(data) = archive.data.get(&entry.dump_id) {
+        // Check for blob data first, then regular data
+        if let Some(blobs) = archive.blobs.get(&entry.dump_id) {
             let pos = w.stream_position()?;
             actual_offsets.insert(entry.dump_id, pos);
-
-            // Determine block type
-            let block_type = if entry.desc == crate::constants::BLOBS {
-                BlockType::Blobs
-            } else {
-                BlockType::Data
-            };
-
-            write_data_block(w, &archive.header, block_type, entry.dump_id, data)?;
+            write_blob_block(w, &archive.header, entry.dump_id, blobs)?;
+        } else if let Some(data) = archive.data.get(&entry.dump_id) {
+            let pos = w.stream_position()?;
+            actual_offsets.insert(entry.dump_id, pos);
+            write_data_block(w, &archive.header, entry.dump_id, data)?;
         }
     }
 
@@ -549,53 +541,81 @@ fn write_entry<W: std::io::Write + Seek>(w: &mut W, entry: &Entry, header: &Head
     Ok(offset_pos)
 }
 
-/// Write a data block (block type byte + dump_id + compressed chunks + terminator).
+/// Write a BLK_DATA block (block type + dump_id + compressed chunks + terminator).
 fn write_data_block<W: std::io::Write>(
     w: &mut W,
     header: &Header,
-    block_type: BlockType,
     dump_id: i32,
     data: &[u8],
 ) -> Result<()> {
-    write_byte(w, block_type as u8)?;
+    write_byte(w, BlockType::Data as u8)?;
     write_int(w, dump_id, header.int_size)?;
-
-    // BLK_BLOBS data contains the raw oid+chunks structure from reading;
-    // write it verbatim (it already includes compression and terminators).
-    if block_type == BlockType::Blobs {
-        w.write_all(data)?;
-        return Ok(());
-    }
 
     if data.is_empty() {
         write_int(w, 0, header.int_size)?;
         return Ok(());
     }
 
+    write_compressed_chunks(w, header, data)?;
+
+    // Write terminator (zero-length chunk)
+    write_int(w, 0, header.int_size)?;
+    Ok(())
+}
+
+/// Write a BLK_BLOBS block from individual blob entries.
+///
+/// Structure: block_type + dump_id + (oid + compressed_chunks + terminator)... + oid(0)
+fn write_blob_block<W: std::io::Write>(
+    w: &mut W,
+    header: &Header,
+    dump_id: i32,
+    blobs: &[Blob],
+) -> Result<()> {
+    write_byte(w, BlockType::Blobs as u8)?;
+    write_int(w, dump_id, header.int_size)?;
+
+    for blob in blobs {
+        write_int(w, blob.oid, header.int_size)?;
+        write_compressed_chunks(w, header, &blob.data)?;
+        // Terminator for this blob's data
+        write_int(w, 0, header.int_size)?;
+    }
+
+    // Terminating zero OID
+    write_int(w, 0, header.int_size)?;
+    Ok(())
+}
+
+/// Write data as compressed (or uncompressed) chunks.
+fn write_compressed_chunks<W: std::io::Write>(
+    w: &mut W,
+    header: &Header,
+    data: &[u8],
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
     match header.compression {
         CompressionAlgorithm::None => {
-            // Write data in chunks
             for chunk in data.chunks(4096) {
                 write_int(w, chunk.len() as i32, header.int_size)?;
                 w.write_all(chunk)?;
             }
         }
         _ => {
-            // Compress the entire data block
             let mut compressed = Vec::new();
             {
                 let mut comp = compress::compressor(header.compression, &mut compressed)?;
                 comp.write_all(data)?;
                 comp.flush()?;
             }
-            // Write compressed data as a single chunk
             write_int(w, compressed.len() as i32, header.int_size)?;
             w.write_all(&compressed)?;
         }
     }
 
-    // Write terminator (zero-length chunk)
-    write_int(w, 0, header.int_size)?;
     Ok(())
 }
 
@@ -689,6 +709,7 @@ mod tests {
                 offset: 0,
             }],
             data: HashMap::new(),
+            blobs: HashMap::new(),
         };
 
         let mut buf = Cursor::new(Vec::new());
@@ -739,6 +760,7 @@ mod tests {
                 offset: 0,
             }],
             data: HashMap::new(),
+            blobs: HashMap::new(),
         };
         archive.data.insert(1, data_content.to_vec());
 

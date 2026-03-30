@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::constants;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-use crate::format::custom::{self, ArchiveData, Timestamp};
+use crate::format::custom::{self, ArchiveData, Blob, Timestamp};
 use crate::header::Header;
 use crate::types::{CompressionAlgorithm, Format, OffsetState};
 use crate::version::{self, ArchiveVersion};
@@ -21,6 +21,7 @@ pub struct Dump {
     pub(crate) dump_version: String,
     pub(crate) entries: Vec<Entry>,
     pub(crate) data: HashMap<i32, Vec<u8>>,
+    pub(crate) blobs: HashMap<i32, Vec<Blob>>,
     next_dump_id: i32,
 }
 
@@ -57,6 +58,7 @@ impl Dump {
             dump_version: format!("pg_dump (PostgreSQL) {appear_as}"),
             entries: Vec::new(),
             data: HashMap::new(),
+            blobs: HashMap::new(),
             next_dump_id: 1,
         };
 
@@ -105,6 +107,7 @@ impl Dump {
             dump_version: archive.dump_version,
             entries: archive.entries,
             data: archive.data,
+            blobs: archive.blobs,
             next_dump_id,
         }
     }
@@ -148,6 +151,7 @@ impl Dump {
             dump_version: self.dump_version.clone(),
             entries: self.entries.clone(),
             data: self.data.clone(),
+            blobs: self.blobs.clone(),
         }
     }
 
@@ -233,20 +237,54 @@ impl Dump {
             .filter(|line| !line.is_empty() && *line != "\\."))
     }
 
-    /// Iterate over large objects (blobs).
+    /// Iterate over all large objects (blobs) across all BLOBS entries.
     ///
-    /// Yields (oid, data) pairs.
-    pub fn blobs(&self) -> Result<Vec<(String, &[u8])>> {
+    /// Yields `(oid, data)` pairs where `oid` is the large object OID and
+    /// `data` is the decompressed blob content.
+    pub fn blobs(&self) -> Vec<(i32, &[u8])> {
         let mut result = Vec::new();
         for entry in &self.entries {
             if (entry.desc == constants::BLOBS || entry.desc == constants::BLOB)
-                && let Some(data) = self.data.get(&entry.dump_id)
+                && let Some(blob_list) = self.blobs.get(&entry.dump_id)
             {
-                let oid = entry.tag.as_deref().unwrap_or("0");
-                result.push((oid.to_string(), data.as_slice()));
+                for blob in blob_list {
+                    result.push((blob.oid, blob.data.as_slice()));
+                }
             }
         }
-        Ok(result)
+        result
+    }
+
+    /// Add a large object (blob) to a BLOBS entry.
+    ///
+    /// If no BLOBS entry exists yet, one is created automatically.
+    /// Returns the OID of the added blob.
+    pub fn add_blob(&mut self, oid: i32, data: Vec<u8>) -> Result<i32> {
+        // Find or create a BLOBS entry
+        let blobs_dump_id = if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.desc == constants::BLOBS && e.had_dumper)
+        {
+            entry.dump_id
+        } else {
+            let dump_id =
+                self.add_entry(constants::BLOBS, None, None, None, None, None, None, &[])?;
+            let entry = self
+                .entries
+                .iter_mut()
+                .find(|e| e.dump_id == dump_id)
+                .unwrap();
+            entry.had_dumper = true;
+            entry.data_state = OffsetState::NotSet;
+            dump_id
+        };
+
+        self.blobs
+            .entry(blobs_dump_id)
+            .or_default()
+            .push(Blob { oid, data });
+        Ok(oid)
     }
 
     /// Get the raw data bytes for an entry by dump_id.

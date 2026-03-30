@@ -246,3 +246,51 @@ fn test_round_trip_zstd_new_dump() {
     assert_eq!(rows[0], "0\tvalue_0");
     assert_eq!(rows[99], "99\tvalue_99");
 }
+
+#[test]
+fn test_round_trip_blobs() {
+    let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("failed to create dump");
+
+    let blob1_data = b"hello blob 1".to_vec();
+    let blob2_data = vec![0u8, 1, 2, 3, 255, 254, 253];
+    dump.add_blob(16601, blob1_data.clone())
+        .expect("failed to add blob 1");
+    dump.add_blob(16602, blob2_data.clone())
+        .expect("failed to add blob 2");
+
+    // Verify before save
+    let blobs = dump.blobs();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(blobs[0].0, 16601);
+    assert_eq!(blobs[0].1, b"hello blob 1");
+    assert_eq!(blobs[1].0, 16602);
+    assert_eq!(blobs[1].1, &[0u8, 1, 2, 3, 255, 254, 253]);
+
+    // Save and reload
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+    let blobs = reloaded.blobs();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(blobs[0].0, 16601);
+    assert_eq!(blobs[0].1, blob1_data.as_slice());
+    assert_eq!(blobs[1].0, 16602);
+    assert_eq!(blobs[1].1, blob2_data.as_slice());
+}
+
+#[test]
+fn test_read_blobs_from_fixture() {
+    let Some(path) = fixture_path("dump.not-compressed") else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let dump = libpgdump::load(&path).expect("failed to load dump");
+    let blobs = dump.blobs();
+    if !blobs.is_empty() {
+        for (oid, data) in &blobs {
+            assert!(*oid > 0, "blob OID should be positive");
+            assert!(!data.is_empty(), "blob data should not be empty");
+        }
+    }
+}
