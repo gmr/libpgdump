@@ -1,6 +1,6 @@
 [package]
 name = "libpgdump"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A Rust library for reading and writing PostgreSQL dump files"
