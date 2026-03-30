@@ -23,7 +23,19 @@ pub fn read_archive(path: &Path) -> Result<ArchiveData> {
         if member.name == "restore.sql" {
             continue;
         }
-        let file_path = tmp.path().join(&member.name);
+        // Reject paths that could escape the temp directory
+        let member_path = std::path::Path::new(&member.name);
+        let mut components = member_path.components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => {}
+            _ => {
+                return Err(Error::DataIntegrity(format!(
+                    "unsupported tar member path '{}'",
+                    member.name
+                )));
+            }
+        }
+        let file_path = tmp.path().join(member_path);
         std::fs::write(&file_path, &member.data)?;
     }
 
@@ -169,7 +181,7 @@ fn parse_tar_size(header: &[u8]) -> Result<usize> {
 
 /// Write a single tar member (header + data + padding).
 fn write_tar_member<W: Write>(w: &mut W, name: &str, data: &[u8]) -> Result<()> {
-    let header = build_tar_header(name, data.len());
+    let header = build_tar_header(name, data.len())?;
     w.write_all(&header)?;
     w.write_all(data)?;
 
@@ -183,7 +195,7 @@ fn write_tar_member<W: Write>(w: &mut W, name: &str, data: &[u8]) -> Result<()> 
 }
 
 /// Build a 512-byte POSIX ustar tar header.
-fn build_tar_header(name: &str, size: usize) -> [u8; TAR_BLOCK_SIZE] {
+fn build_tar_header(name: &str, size: usize) -> Result<[u8; TAR_BLOCK_SIZE]> {
     let mut header = [0u8; TAR_BLOCK_SIZE];
 
     // Filename (offset 0, 100 bytes)
@@ -192,19 +204,19 @@ fn build_tar_header(name: &str, size: usize) -> [u8; TAR_BLOCK_SIZE] {
     header[..len].copy_from_slice(&name_bytes[..len]);
 
     // File mode (offset 100, 8 bytes) — 0600
-    write_octal(&mut header[100..108], 0o600, 7);
+    write_octal(&mut header[100..108], 0o600, 7)?;
 
     // UID (offset 108, 8 bytes)
-    write_octal(&mut header[108..116], 0, 7);
+    write_octal(&mut header[108..116], 0, 7)?;
 
     // GID (offset 116, 8 bytes)
-    write_octal(&mut header[116..124], 0, 7);
+    write_octal(&mut header[116..124], 0, 7)?;
 
     // File size (offset 124, 12 bytes)
-    write_octal(&mut header[124..136], size, 11);
+    write_octal(&mut header[124..136], size, 11)?;
 
     // Modify time (offset 136, 12 bytes) — use 0
-    write_octal(&mut header[136..148], 0, 11);
+    write_octal(&mut header[136..148], 0, 11)?;
 
     // Type flag (offset 156, 1 byte) — '0' = regular file
     header[156] = b'0';
@@ -219,23 +231,25 @@ fn build_tar_header(name: &str, size: usize) -> [u8; TAR_BLOCK_SIZE] {
     // Per POSIX: checksum is computed with the checksum field treated as spaces
     header[148..156].copy_from_slice(b"        ");
     let checksum: u32 = header.iter().map(|&b| b as u32).sum();
-    write_octal(&mut header[148..156], checksum as usize, 6);
+    write_octal(&mut header[148..156], checksum as usize, 6)?;
     header[154] = 0;
     header[155] = b' ';
 
-    header
+    Ok(header)
 }
 
 /// Write a value as zero-padded octal ASCII into a tar header field.
-fn write_octal(buf: &mut [u8], value: usize, width: usize) {
+fn write_octal(buf: &mut [u8], value: usize, width: usize) -> Result<()> {
     let s = format!("{value:0>width$o}", width = width);
     let bytes = s.as_bytes();
-    let start = if bytes.len() > buf.len() - 1 {
-        bytes.len() - (buf.len() - 1)
-    } else {
-        0
-    };
-    buf[..bytes.len() - start].copy_from_slice(&bytes[start..]);
+    if bytes.len() > buf.len() - 1 {
+        return Err(Error::DataIntegrity(format!(
+            "tar header field overflow: {value} does not fit in {} octal bytes",
+            buf.len() - 1
+        )));
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Ok(())
 }
 
 impl Clone for ArchiveData {
@@ -396,7 +410,7 @@ mod tests {
 
     #[test]
     fn test_tar_header_checksum() {
-        let header = build_tar_header("test.dat", 1024);
+        let header = build_tar_header("test.dat", 1024).unwrap();
         // Verify magic
         assert_eq!(&header[257..263], b"ustar\0");
         // Verify type flag
