@@ -22,23 +22,27 @@ impl<R: Read> Read for GzipDecompressor<R> {
 }
 
 pub struct GzipCompressor<W: Write> {
-    inner: ZlibEncoder<W>,
+    inner: Option<ZlibEncoder<W>>,
 }
 
 impl<W: Write> GzipCompressor<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            inner: ZlibEncoder::new(writer, flate2::Compression::default()),
+            inner: Some(ZlibEncoder::new(writer, flate2::Compression::default())),
         }
     }
 }
 
 impl<W: Write> Write for GzipCompressor<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        self.inner.as_mut().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        // Finalize the zlib stream, writing the trailer and checksum.
+        if let Some(encoder) = self.inner.take() {
+            encoder.finish()?;
+        }
+        Ok(())
     }
 }

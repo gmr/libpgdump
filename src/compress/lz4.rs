@@ -21,23 +21,27 @@ impl<R: Read> Read for Lz4Decompressor<R> {
 }
 
 pub struct Lz4Compressor<W: Write> {
-    inner: FrameEncoder<W>,
+    inner: Option<FrameEncoder<W>>,
 }
 
 impl<W: Write> Lz4Compressor<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            inner: FrameEncoder::new(writer),
+            inner: Some(FrameEncoder::new(writer)),
         }
     }
 }
 
 impl<W: Write> Write for Lz4Compressor<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        self.inner.as_mut().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        // Finalize the LZ4 frame, writing the frame footer.
+        if let Some(encoder) = self.inner.take() {
+            encoder.finish()?;
+        }
+        Ok(())
     }
 }

@@ -52,6 +52,11 @@ pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
     let dump_version = read_string(r, int_size)?.unwrap_or_default();
 
     let toc_count = read_int(r, int_size)?;
+    if toc_count < 0 {
+        return Err(Error::DataIntegrity(format!(
+            "invalid TOC entry count: {toc_count}"
+        )));
+    }
     let mut entries = Vec::with_capacity(toc_count as usize);
     for _ in 0..toc_count {
         entries.push(read_entry(r, &header)?);
@@ -97,10 +102,21 @@ fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     }
 
     let int_size = read_byte(r)?;
+    if !(1..=8).contains(&int_size) {
+        return Err(Error::InvalidHeader(format!(
+            "invalid integer size: {int_size} (expected 1-8)"
+        )));
+    }
 
     // Offset size was added in v1.7
     let off_size = if version >= ArchiveVersion::new(1, 7, 0) {
-        read_byte(r)?
+        let s = read_byte(r)?;
+        if !(1..=8).contains(&s) {
+            return Err(Error::InvalidHeader(format!(
+                "invalid offset size: {s} (expected 1-8)"
+            )));
+        }
+        s
     } else {
         int_size
     };
