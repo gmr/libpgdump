@@ -32,10 +32,7 @@ fn test_load_uncompressed() {
         .iter()
         .filter(|e| e.desc == "TABLE DATA")
         .count();
-    assert!(
-        table_data_count > 0,
-        "dump should have TABLE DATA entries"
-    );
+    assert!(table_data_count > 0, "dump should have TABLE DATA entries");
 }
 
 #[test]
@@ -106,10 +103,7 @@ fn test_read_table_data_uncompressed() {
         .table_data("public", "pgbench_accounts")
         .expect("failed to get pgbench_accounts data")
         .collect();
-    assert!(
-        !rows.is_empty(),
-        "pgbench_accounts should have rows"
-    );
+    assert!(!rows.is_empty(), "pgbench_accounts should have rows");
 
     // Each row should be tab-separated
     for row in &rows {
@@ -147,10 +141,7 @@ fn test_lookup_entry() {
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
     let entry = dump.lookup_entry("TABLE", "public", "pgbench_accounts");
-    assert!(
-        entry.is_some(),
-        "should find pgbench_accounts TABLE entry"
-    );
+    assert!(entry.is_some(), "should find pgbench_accounts TABLE entry");
     let entry = entry.unwrap();
     assert_eq!(entry.tag.as_deref(), Some("pgbench_accounts"));
     assert!(entry.defn.is_some(), "TABLE entry should have a definition");
@@ -196,9 +187,6 @@ fn test_entry_dependencies() {
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
     // TABLE DATA entries typically depend on their TABLE entry
-    let has_deps = dump
-        .entries()
-        .iter()
-        .any(|e| !e.dependencies.is_empty());
+    let has_deps = dump.entries().iter().any(|e| !e.dependencies.is_empty());
     assert!(has_deps, "some entries should have dependencies");
 }

@@ -16,8 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, nightly]
-        postgres: [15, 16, 17, 18]
+        postgres: [16, 17, 18]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -37,10 +36,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
@@ -50,9 +48,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+            ${{ runner.os }}-cargo-
 
       - name: Set up Python
         uses: actions/setup-python@v6

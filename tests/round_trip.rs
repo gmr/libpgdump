@@ -30,14 +30,26 @@ fn test_round_trip_uncompressed() {
     // Compare entries
     for (orig, reload) in dump.entries().iter().zip(reloaded.entries().iter()) {
         assert_eq!(orig.dump_id, reload.dump_id, "dump_id mismatch");
-        assert_eq!(orig.desc, reload.desc, "desc mismatch for dump_id {}", orig.dump_id);
-        assert_eq!(orig.tag, reload.tag, "tag mismatch for dump_id {}", orig.dump_id);
+        assert_eq!(
+            orig.desc, reload.desc,
+            "desc mismatch for dump_id {}",
+            orig.dump_id
+        );
+        assert_eq!(
+            orig.tag, reload.tag,
+            "tag mismatch for dump_id {}",
+            orig.dump_id
+        );
         assert_eq!(
             orig.namespace, reload.namespace,
             "namespace mismatch for dump_id {}",
             orig.dump_id
         );
-        assert_eq!(orig.defn, reload.defn, "defn mismatch for dump_id {}", orig.dump_id);
+        assert_eq!(
+            orig.defn, reload.defn,
+            "defn mismatch for dump_id {}",
+            orig.dump_id
+        );
         assert_eq!(
             orig.copy_stmt, reload.copy_stmt,
             "copy_stmt mismatch for dump_id {}",
