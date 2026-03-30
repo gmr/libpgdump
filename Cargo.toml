@@ -1,0 +1,18 @@
+[package]
+name = "libpgdump"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A Rust library for reading and writing PostgreSQL dump files"
+license = "BSD-3-Clause"
+repository = "https://github.com/gmr/libpgdump"
+keywords = ["postgresql", "pg_dump", "backup", "restore"]
+categories = ["database", "parser-implementations"]
+
+[dependencies]
+flate2 = "1"
+thiserror = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
