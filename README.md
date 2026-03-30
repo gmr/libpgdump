@@ -102,7 +102,7 @@ match libpgdump::load("backup.dump") {
 ## Supported features
 
 - **Read/write** custom format (`-Fc`) archives
-- **Compression**: none and gzip (lz4 and zstd planned)
+- **Compression**: none, gzip, lz4, and zstd
 - **Archive versions** 1.12.0 through 1.16.0 (PostgreSQL 9.0–18)
 - **Version-aware parsing**: handles all format variations across versions
 - **60+ object types**: tables, indexes, views, functions, constraints, extensions, etc.

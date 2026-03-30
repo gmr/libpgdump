@@ -11,7 +11,9 @@ categories = ["database", "parser-implementations"]
 
 [dependencies]
 flate2 = "1"
+lz4_flex = "0.11"
 thiserror = "2"
+zstd = "0.13"
 
 [dev-dependencies]
 pretty_assertions = "1"

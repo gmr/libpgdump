@@ -157,3 +157,84 @@ fn test_round_trip_compressed_new_dump() {
     assert_eq!(rows[0], "0\tvalue_0");
     assert_eq!(rows[99], "99\tvalue_99");
 }
+
+#[test]
+fn test_round_trip_lz4_new_dump() {
+    let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("failed to create dump");
+    dump.set_compression(libpgdump::CompressionAlgorithm::Lz4);
+
+    let data_id = dump
+        .add_entry(
+            "TABLE DATA",
+            Some("public"),
+            Some("items"),
+            Some("postgres"),
+            None,
+            None,
+            Some("COPY public.items (id, value) FROM stdin;\n"),
+            &[],
+        )
+        .expect("failed to add entry");
+
+    let mut data = String::new();
+    for i in 0..100 {
+        data.push_str(&format!("{i}\tvalue_{i}\n"));
+    }
+    dump.set_entry_data(data_id, data.into_bytes())
+        .expect("failed to set data");
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+    assert_eq!(reloaded.compression(), libpgdump::CompressionAlgorithm::Lz4);
+    let rows: Vec<&str> = reloaded
+        .table_data("public", "items")
+        .expect("failed to get table data")
+        .collect();
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows[0], "0\tvalue_0");
+    assert_eq!(rows[99], "99\tvalue_99");
+}
+
+#[test]
+fn test_round_trip_zstd_new_dump() {
+    let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("failed to create dump");
+    dump.set_compression(libpgdump::CompressionAlgorithm::Zstd);
+
+    let data_id = dump
+        .add_entry(
+            "TABLE DATA",
+            Some("public"),
+            Some("items"),
+            Some("postgres"),
+            None,
+            None,
+            Some("COPY public.items (id, value) FROM stdin;\n"),
+            &[],
+        )
+        .expect("failed to add entry");
+
+    let mut data = String::new();
+    for i in 0..100 {
+        data.push_str(&format!("{i}\tvalue_{i}\n"));
+    }
+    dump.set_entry_data(data_id, data.into_bytes())
+        .expect("failed to set data");
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+    assert_eq!(
+        reloaded.compression(),
+        libpgdump::CompressionAlgorithm::Zstd
+    );
+    let rows: Vec<&str> = reloaded
+        .table_data("public", "items")
+        .expect("failed to get table data")
+        .collect();
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows[0], "0\tvalue_0");
+    assert_eq!(rows[99], "99\tvalue_99");
+}

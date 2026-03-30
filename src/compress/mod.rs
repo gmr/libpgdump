@@ -1,5 +1,7 @@
 pub mod gzip;
+pub mod lz4;
 pub mod none;
+pub mod zstd;
 
 use std::io::{Read, Write};
 
@@ -14,11 +16,9 @@ pub fn decompressor<'a, R: Read + 'a>(
     match alg {
         CompressionAlgorithm::None => Ok(Box::new(none::NoneDecompressor::new(reader))),
         CompressionAlgorithm::Gzip => Ok(Box::new(gzip::GzipDecompressor::new(reader))),
-        CompressionAlgorithm::Lz4 => Err(crate::error::Error::UnsupportedCompression(
-            CompressionAlgorithm::Lz4 as u8,
-        )),
-        CompressionAlgorithm::Zstd => Err(crate::error::Error::UnsupportedCompression(
-            CompressionAlgorithm::Zstd as u8,
+        CompressionAlgorithm::Lz4 => Ok(Box::new(lz4::Lz4Decompressor::new(reader))),
+        CompressionAlgorithm::Zstd => Ok(Box::new(
+            zstd::ZstdDecompressor::new(reader).map_err(crate::error::Error::Io)?,
         )),
     }
 }
@@ -31,11 +31,9 @@ pub fn compressor<'a, W: Write + 'a>(
     match alg {
         CompressionAlgorithm::None => Ok(Box::new(none::NoneCompressor::new(writer))),
         CompressionAlgorithm::Gzip => Ok(Box::new(gzip::GzipCompressor::new(writer))),
-        CompressionAlgorithm::Lz4 => Err(crate::error::Error::UnsupportedCompression(
-            CompressionAlgorithm::Lz4 as u8,
-        )),
-        CompressionAlgorithm::Zstd => Err(crate::error::Error::UnsupportedCompression(
-            CompressionAlgorithm::Zstd as u8,
+        CompressionAlgorithm::Lz4 => Ok(Box::new(lz4::Lz4Compressor::new(writer))),
+        CompressionAlgorithm::Zstd => Ok(Box::new(
+            zstd::ZstdCompressor::new(writer).map_err(crate::error::Error::Io)?,
         )),
     }
 }
