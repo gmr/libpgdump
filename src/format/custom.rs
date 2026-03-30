@@ -10,7 +10,7 @@ use crate::io::primitives::{
     read_byte, read_int, read_offset, read_string, write_byte, write_int, write_offset,
     write_string,
 };
-use crate::types::{BlockType, CompressionAlgorithm, Format, OffsetState, Section};
+use crate::types::{BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 
 /// Timestamp fields from the archive header.
@@ -181,7 +181,7 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     let table_oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let tag = read_string(r, int_size)?;
-    let desc = read_string(r, int_size)?.unwrap_or_default();
+    let desc: ObjectType = read_string(r, int_size)?.unwrap_or_default().into();
 
     // Section integer is in the file (v>=1.11)
     let section = if version >= ArchiveVersion::new(1, 11, 0) {
@@ -487,7 +487,8 @@ fn write_entry<W: std::io::Write + Seek>(w: &mut W, entry: &Entry, header: &Head
     write_string(w, Some(&entry.table_oid), int_size)?;
     write_string(w, Some(&entry.oid), int_size)?;
     write_string(w, entry.tag.as_deref(), int_size)?;
-    write_string(w, Some(&entry.desc), int_size)?;
+    let desc_str = entry.desc.to_string();
+    write_string(w, Some(&desc_str), int_size)?;
 
     if version >= ArchiveVersion::new(1, 11, 0) {
         write_int(w, entry.section.to_int(), int_size)?;
@@ -694,7 +695,7 @@ mod tests {
                 table_oid: "0".to_string(),
                 oid: "0".to_string(),
                 tag: Some("ENCODING".to_string()),
-                desc: "ENCODING".to_string(),
+                desc: ObjectType::Encoding,
                 section: Section::PreData,
                 defn: Some("SET client_encoding = 'UTF8';\n".to_string()),
                 drop_stmt: None,
@@ -723,7 +724,7 @@ mod tests {
         assert_eq!(parsed.dbname, "testdb");
         assert_eq!(parsed.server_version, "17.0");
         assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.entries[0].desc, "ENCODING");
+        assert_eq!(parsed.entries[0].desc, ObjectType::Encoding);
         assert_eq!(
             parsed.entries[0].defn.as_deref(),
             Some("SET client_encoding = 'UTF8';\n")
@@ -746,7 +747,7 @@ mod tests {
                 table_oid: "16384".to_string(),
                 oid: "0".to_string(),
                 tag: Some("users".to_string()),
-                desc: "TABLE DATA".to_string(),
+                desc: ObjectType::TableData,
                 section: Section::Data,
                 defn: None,
                 drop_stmt: None,

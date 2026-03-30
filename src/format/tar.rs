@@ -274,7 +274,7 @@ mod tests {
     use super::*;
     use crate::entry::Entry;
     use crate::format::custom::{Blob, Timestamp};
-    use crate::types::{OffsetState, Section};
+    use crate::types::{ObjectType, OffsetState, Section};
     use crate::version::ArchiveVersion;
 
     fn make_test_header() -> Header {
@@ -311,7 +311,7 @@ mod tests {
                 table_oid: "16384".to_string(),
                 oid: "0".to_string(),
                 tag: Some("users".to_string()),
-                desc: "TABLE DATA".to_string(),
+                desc: ObjectType::TableData,
                 section: Section::Data,
                 defn: None,
                 drop_stmt: None,
@@ -363,7 +363,7 @@ mod tests {
                 table_oid: "0".to_string(),
                 oid: "0".to_string(),
                 tag: None,
-                desc: "BLOBS".to_string(),
+                desc: ObjectType::Blobs,
                 section: Section::Data,
                 defn: None,
                 drop_stmt: None,

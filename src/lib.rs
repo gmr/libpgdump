@@ -17,7 +17,7 @@ pub use entry::Entry;
 pub use error::{Error, Result};
 pub use format::custom::Blob;
 pub use header::Header;
-pub use types::{BlockType, CompressionAlgorithm, Format, OffsetState, Section};
+pub use types::{BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
 pub use version::ArchiveVersion;
 
 /// Load a PostgreSQL custom format dump file.

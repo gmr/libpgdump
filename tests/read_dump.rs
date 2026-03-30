@@ -17,14 +17,17 @@ fn test_load_uncompressed() {
     assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::None);
 
     // Should have ENCODING, STDSTRINGS, SEARCHPATH entries
-    let has_encoding = dump.entries().iter().any(|e| e.desc == "ENCODING");
+    let has_encoding = dump
+        .entries()
+        .iter()
+        .any(|e| e.desc == libpgdump::ObjectType::Encoding);
     assert!(has_encoding, "dump should have an ENCODING entry");
 
     // Check that there are TABLE DATA entries
     let table_data_count = dump
         .entries()
         .iter()
-        .filter(|e| e.desc == "TABLE DATA")
+        .filter(|e| e.desc == libpgdump::ObjectType::TableData)
         .count();
     assert!(table_data_count > 0, "dump should have TABLE DATA entries");
 }
@@ -45,7 +48,7 @@ fn test_load_compressed() {
     let table_data_count = dump
         .entries()
         .iter()
-        .filter(|e| e.desc == "TABLE DATA")
+        .filter(|e| e.desc == libpgdump::ObjectType::TableData)
         .count();
     assert!(
         table_data_count > 0,
@@ -65,7 +68,7 @@ fn test_load_schema_only() {
 
     // TABLE DATA entries should exist but have no data
     for entry in dump.entries() {
-        if entry.desc == "TABLE DATA" {
+        if entry.desc == libpgdump::ObjectType::TableData {
             assert!(
                 !entry.had_dumper,
                 "schema-only dump should not have data dumpers"
@@ -134,7 +137,7 @@ fn test_lookup_entry() {
     };
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
-    let entry = dump.lookup_entry("TABLE", "public", "pgbench_accounts");
+    let entry = dump.lookup_entry(&libpgdump::ObjectType::Table, "public", "pgbench_accounts");
     assert!(entry.is_some(), "should find pgbench_accounts TABLE entry");
     let entry = entry.unwrap();
     assert_eq!(entry.tag.as_deref(), Some("pgbench_accounts"));
@@ -161,12 +164,13 @@ fn test_entry_sections() {
     };
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
+    use libpgdump::ObjectType;
     for entry in dump.entries() {
-        match entry.desc.as_str() {
-            "TABLE" => assert_eq!(entry.section, libpgdump::Section::PreData),
-            "TABLE DATA" => assert_eq!(entry.section, libpgdump::Section::Data),
-            "INDEX" => assert_eq!(entry.section, libpgdump::Section::PostData),
-            "CONSTRAINT" => assert_eq!(entry.section, libpgdump::Section::PostData),
+        match entry.desc {
+            ObjectType::Table => assert_eq!(entry.section, libpgdump::Section::PreData),
+            ObjectType::TableData => assert_eq!(entry.section, libpgdump::Section::Data),
+            ObjectType::Index => assert_eq!(entry.section, libpgdump::Section::PostData),
+            ObjectType::Constraint => assert_eq!(entry.section, libpgdump::Section::PostData),
             _ => {}
         }
     }
@@ -201,7 +205,7 @@ fn test_load_directory() {
     let table_data_count = dump
         .entries()
         .iter()
-        .filter(|e| e.desc == "TABLE DATA")
+        .filter(|e| e.desc == libpgdump::ObjectType::TableData)
         .count();
     assert!(
         table_data_count > 0,

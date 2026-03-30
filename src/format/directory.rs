@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::compress;
-use crate::constants::{self, MAGIC};
+use crate::constants::MAGIC;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::format::custom::{ArchiveData, Blob, Timestamp};
@@ -12,7 +12,7 @@ use crate::header::Header;
 use crate::io::primitives::{
     read_byte, read_int, read_string, write_byte, write_int, write_string,
 };
-use crate::types::{CompressionAlgorithm, Format, OffsetState, Section};
+use crate::types::{CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 use flate2::read::GzDecoder;
 
@@ -264,7 +264,7 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     let table_oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let tag = read_string(r, int_size)?;
-    let desc = read_string(r, int_size)?.unwrap_or_default();
+    let desc: ObjectType = read_string(r, int_size)?.unwrap_or_default().into();
 
     let section = if version >= ArchiveVersion::new(1, 11, 0) {
         let sec_int = read_int(r, int_size)?;
@@ -377,7 +377,8 @@ fn write_entry<W: Write>(w: &mut W, entry: &Entry, header: &Header) -> Result<()
     write_string(w, Some(&entry.table_oid), int_size)?;
     write_string(w, Some(&entry.oid), int_size)?;
     write_string(w, entry.tag.as_deref(), int_size)?;
-    write_string(w, Some(&entry.desc), int_size)?;
+    let desc_str = entry.desc.to_string();
+    write_string(w, Some(&desc_str), int_size)?;
 
     if version >= ArchiveVersion::new(1, 11, 0) {
         write_int(w, entry.section.to_int(), int_size)?;
@@ -465,7 +466,7 @@ fn read_data_files(
             _ => continue,
         };
 
-        if entry.desc == constants::BLOBS {
+        if entry.desc == ObjectType::Blobs {
             // Read blob TOC file and individual blob files
             let blobs = read_blob_toc(dir, header, filename)?;
             if !blobs.is_empty() {
@@ -652,7 +653,7 @@ mod tests {
                 table_oid: "0".to_string(),
                 oid: "0".to_string(),
                 tag: Some("ENCODING".to_string()),
-                desc: "ENCODING".to_string(),
+                desc: ObjectType::Encoding,
                 section: Section::PreData,
                 defn: Some("SET client_encoding = 'UTF8';\n".to_string()),
                 drop_stmt: None,
@@ -678,7 +679,7 @@ mod tests {
         let parsed = read_archive(tmp.path()).unwrap();
         assert_eq!(parsed.dbname, "testdb");
         assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.entries[0].desc, "ENCODING");
+        assert_eq!(parsed.entries[0].desc, ObjectType::Encoding);
     }
 
     #[test]
@@ -705,7 +706,7 @@ mod tests {
                 table_oid: "16384".to_string(),
                 oid: "0".to_string(),
                 tag: Some("users".to_string()),
-                desc: "TABLE DATA".to_string(),
+                desc: ObjectType::TableData,
                 section: Section::Data,
                 defn: None,
                 drop_stmt: None,
@@ -760,7 +761,7 @@ mod tests {
                 table_oid: "0".to_string(),
                 oid: "0".to_string(),
                 tag: None,
-                desc: "BLOBS".to_string(),
+                desc: ObjectType::Blobs,
                 section: Section::Data,
                 defn: None,
                 drop_stmt: None,

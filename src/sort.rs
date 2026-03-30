@@ -13,73 +13,7 @@
 
 use std::collections::BinaryHeap;
 
-use crate::constants;
 use crate::entry::Entry;
-
-/// Object-type priority, mirroring `dbObjectTypePriorities` in
-/// `pg_dump_sort.c`.  Lower numbers sort first.  Unrecognised types get 0
-/// so they sort before everything else rather than silently drifting to the end.
-fn type_priority(desc: &str) -> i32 {
-    match desc {
-        constants::ENCODING | constants::STDSTRINGS | constants::SEARCHPATH => 1,
-        constants::DATABASE | constants::DATABASE_PROPERTIES => 2,
-        constants::SCHEMA => 3,
-        constants::PROCEDURAL_LANGUAGE => 4,
-        constants::COLLATION => 5,
-        constants::TRANSFORM => 6,
-        constants::EXTENSION => 7,
-        constants::TYPE | constants::SHELL_TYPE | constants::DOMAIN => 8,
-        constants::CAST => 9,
-        constants::FUNCTION | constants::PROCEDURE => 10,
-        constants::AGGREGATE => 11,
-        constants::ACCESS_METHOD => 12,
-        constants::OPERATOR => 13,
-        constants::OPERATOR_FAMILY | constants::OPERATOR_CLASS => 14,
-        constants::CONVERSION => 15,
-        constants::TEXT_SEARCH_PARSER => 16,
-        constants::TEXT_SEARCH_TEMPLATE => 17,
-        constants::TEXT_SEARCH_DICTIONARY => 18,
-        constants::TEXT_SEARCH_CONFIGURATION => 19,
-        constants::FOREIGN_DATA_WRAPPER => 20,
-        constants::FOREIGN_SERVER | constants::SERVER => 21,
-        constants::FOREIGN_TABLE | constants::TABLE | constants::SEQUENCE | constants::VIEW => 22,
-        constants::TABLE_ATTACH => 23,
-        // DUMMY_TYPE not applicable — pg_dump internal only
-        constants::DEFAULT | constants::SEQUENCE_OWNED_BY => 24,
-        // -- PRE_DATA / DATA boundary --
-        constants::TABLE_DATA => 25,
-        constants::SEQUENCE_SET => 26,
-        constants::LARGE_OBJECT | constants::BLOB | constants::BLOB_METADATA => 27,
-        constants::BLOBS | constants::PG_LARGEOBJECT => 28,
-        constants::STATISTICS_DATA => 29,
-        // -- DATA / POST_DATA boundary --
-        constants::CHECK_CONSTRAINT | constants::CONSTRAINT => 30,
-        constants::INDEX => 31,
-        constants::INDEX_ATTACH => 32,
-        constants::STATISTICS => 33,
-        constants::RULE => 34,
-        constants::TRIGGER => 35,
-        constants::FK_CONSTRAINT => 36,
-        constants::POLICY | constants::ROW_SECURITY => 37,
-        constants::PUBLICATION => 38,
-        constants::PUBLICATION_TABLE => 39,
-        constants::PUBLICATION_TABLES_IN_SCHEMA => 40,
-        constants::SUBSCRIPTION => 41,
-        constants::SUBSCRIPTION_TABLE => 42,
-        constants::DEFAULT_ACL => 43,
-        constants::MATERIALIZED_VIEW => 44,
-        constants::MATERIALIZED_VIEW_DATA => 45,
-        constants::EVENT_TRIGGER => 46,
-        // Section::None catch-alls
-        constants::ACL | constants::COMMENT | constants::SECURITY_LABEL => 47,
-        constants::GROUP
-        | constants::ROLE
-        | constants::USER
-        | constants::USER_MAPPING
-        | constants::TABLESPACE => 48,
-        _ => 0,
-    }
-}
 
 /// Compare `Option<String>` with `Some` sorting before `None`.
 fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
@@ -95,11 +29,12 @@ fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
 ///
 /// This mirrors `DOTypeNameCompare` in pg_dump_sort.c.
 fn entry_cmp(a: &Entry, b: &Entry) -> std::cmp::Ordering {
-    type_priority(&a.desc)
-        .cmp(&type_priority(&b.desc))
+    a.desc
+        .priority()
+        .cmp(&b.desc.priority())
         .then_with(|| cmp_opt_str(&a.namespace, &b.namespace))
         .then_with(|| cmp_opt_str(&a.tag, &b.tag))
-        .then_with(|| a.desc.cmp(&b.desc))
+        .then_with(|| a.desc.to_string().cmp(&b.desc.to_string()))
 }
 
 /// Sort entries using the same two-phase strategy as pg_dump:
@@ -213,11 +148,11 @@ fn topo_sort(entries: &mut Vec<Entry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OffsetState;
+    use crate::types::{ObjectType, OffsetState};
 
     fn make_entry(
         dump_id: i32,
-        desc: &str,
+        desc: ObjectType,
         namespace: Option<&str>,
         tag: Option<&str>,
         deps: Vec<i32>,
@@ -228,8 +163,8 @@ mod tests {
             table_oid: "0".to_string(),
             oid: "0".to_string(),
             tag: tag.map(String::from),
-            desc: desc.to_string(),
-            section: crate::constants::section_for_desc(desc),
+            desc: desc.clone(),
+            section: desc.section(),
             defn: None,
             drop_stmt: None,
             copy_stmt: None,
@@ -248,12 +183,11 @@ mod tests {
 
     #[test]
     fn test_type_priority_ordering() {
-        // Schema should come before table, table before index
-        assert!(type_priority(constants::SCHEMA) < type_priority(constants::TABLE));
-        assert!(type_priority(constants::TABLE) < type_priority(constants::TABLE_DATA));
-        assert!(type_priority(constants::TABLE_DATA) < type_priority(constants::INDEX));
-        assert!(type_priority(constants::INDEX) < type_priority(constants::FK_CONSTRAINT));
-        assert!(type_priority(constants::FK_CONSTRAINT) < type_priority(constants::EVENT_TRIGGER));
+        assert!(ObjectType::Schema.priority() < ObjectType::Table.priority());
+        assert!(ObjectType::Table.priority() < ObjectType::TableData.priority());
+        assert!(ObjectType::TableData.priority() < ObjectType::Index.priority());
+        assert!(ObjectType::Index.priority() < ObjectType::FkConstraint.priority());
+        assert!(ObjectType::FkConstraint.priority() < ObjectType::EventTrigger.priority());
     }
 
     #[test]
@@ -261,27 +195,27 @@ mod tests {
         let mut entries = vec![
             make_entry(
                 1,
-                constants::INDEX,
+                ObjectType::Index,
                 Some("public"),
                 Some("idx_test"),
                 vec![],
             ),
-            make_entry(2, constants::TABLE, Some("public"), Some("test"), vec![]),
-            make_entry(3, constants::SCHEMA, None, Some("public"), vec![]),
+            make_entry(2, ObjectType::Table, Some("public"), Some("test"), vec![]),
+            make_entry(3, ObjectType::Schema, None, Some("public"), vec![]),
         ];
         sort_entries(&mut entries);
-        assert_eq!(entries[0].desc, constants::SCHEMA);
-        assert_eq!(entries[1].desc, constants::TABLE);
-        assert_eq!(entries[2].desc, constants::INDEX);
+        assert_eq!(entries[0].desc, ObjectType::Schema);
+        assert_eq!(entries[1].desc, ObjectType::Table);
+        assert_eq!(entries[2].desc, ObjectType::Index);
     }
 
     #[test]
     fn test_sort_respects_dependencies() {
         // Table depends on schema, index depends on table
         let mut entries = vec![
-            make_entry(3, constants::INDEX, Some("public"), Some("idx_a"), vec![2]),
-            make_entry(2, constants::TABLE, Some("public"), Some("a"), vec![1]),
-            make_entry(1, constants::SCHEMA, None, Some("public"), vec![]),
+            make_entry(3, ObjectType::Index, Some("public"), Some("idx_a"), vec![2]),
+            make_entry(2, ObjectType::Table, Some("public"), Some("a"), vec![1]),
+            make_entry(1, ObjectType::Schema, None, Some("public"), vec![]),
         ];
         sort_entries(&mut entries);
         // Schema before table, table before index
@@ -296,8 +230,8 @@ mod tests {
     #[test]
     fn test_sort_namespace_ordering() {
         let mut entries = vec![
-            make_entry(2, constants::TABLE, Some("public"), Some("b"), vec![]),
-            make_entry(1, constants::TABLE, Some("app"), Some("a"), vec![]),
+            make_entry(2, ObjectType::Table, Some("public"), Some("b"), vec![]),
+            make_entry(1, ObjectType::Table, Some("app"), Some("a"), vec![]),
         ];
         sort_entries(&mut entries);
         // "app" namespace sorts before "public"
@@ -308,8 +242,8 @@ mod tests {
     #[test]
     fn test_sort_name_ordering_within_type() {
         let mut entries = vec![
-            make_entry(2, constants::TABLE, Some("public"), Some("zebra"), vec![]),
-            make_entry(1, constants::TABLE, Some("public"), Some("alpha"), vec![]),
+            make_entry(2, ObjectType::Table, Some("public"), Some("zebra"), vec![]),
+            make_entry(1, ObjectType::Table, Some("public"), Some("alpha"), vec![]),
         ];
         sort_entries(&mut entries);
         assert_eq!(entries[0].tag.as_deref(), Some("alpha"));
@@ -327,7 +261,7 @@ mod tests {
     fn test_sort_single_entry() {
         let mut entries = vec![make_entry(
             1,
-            constants::TABLE,
+            ObjectType::Table,
             Some("public"),
             Some("t"),
             vec![],
@@ -340,8 +274,8 @@ mod tests {
     fn test_dependency_cycle_handled() {
         // Circular dependency — sort should not panic
         let mut entries = vec![
-            make_entry(1, constants::TABLE, Some("public"), Some("a"), vec![2]),
-            make_entry(2, constants::TABLE, Some("public"), Some("b"), vec![1]),
+            make_entry(1, ObjectType::Table, Some("public"), Some("a"), vec![2]),
+            make_entry(2, ObjectType::Table, Some("public"), Some("b"), vec![1]),
         ];
         sort_entries(&mut entries);
         assert_eq!(entries.len(), 2);

@@ -1,5 +1,6 @@
 mod common;
 use common::fixture_path;
+use libpgdump::ObjectType;
 
 #[test]
 fn test_round_trip_uncompressed() {
@@ -80,7 +81,7 @@ fn test_round_trip_new_dump() {
     // Add a table entry
     let table_id = dump
         .add_entry(
-            "TABLE",
+            ObjectType::Table,
             Some("public"),
             Some("users"),
             Some("postgres"),
@@ -94,7 +95,7 @@ fn test_round_trip_new_dump() {
     // Add a table data entry
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("users"),
             Some("postgres"),
@@ -136,7 +137,7 @@ fn test_round_trip_compressed_new_dump() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -175,7 +176,7 @@ fn test_round_trip_lz4_new_dump() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -214,7 +215,7 @@ fn test_round_trip_zstd_new_dump() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -304,7 +305,7 @@ fn test_round_trip_directory_format() {
 
     let table_id = dump
         .add_entry(
-            "TABLE",
+            ObjectType::Table,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -317,7 +318,7 @@ fn test_round_trip_directory_format() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -368,7 +369,7 @@ fn test_round_trip_tar_format() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),

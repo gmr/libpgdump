@@ -3,7 +3,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
-use crate::constants;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::format::custom::{self, ArchiveData, Blob, Timestamp};
@@ -11,7 +10,7 @@ use crate::format::directory;
 use crate::format::tar;
 use crate::header::Header;
 use crate::sort;
-use crate::types::{CompressionAlgorithm, Format, OffsetState};
+use crate::types::{CompressionAlgorithm, Format, ObjectType, OffsetState};
 use crate::version::{self, ArchiveVersion};
 
 /// A PostgreSQL dump archive.
@@ -82,7 +81,7 @@ impl Dump {
 
         // Add standard initial entries like pgdumplib does
         dump.add_entry(
-            constants::ENCODING,
+            ObjectType::Encoding,
             None,
             None,
             None,
@@ -92,7 +91,7 @@ impl Dump {
             &[],
         )?;
         dump.add_entry(
-            constants::STDSTRINGS,
+            ObjectType::StdStrings,
             None,
             None,
             None,
@@ -102,7 +101,7 @@ impl Dump {
             &[],
         )?;
         dump.add_entry(
-            constants::SEARCHPATH,
+            ObjectType::SearchPath,
             None,
             None,
             None,
@@ -247,10 +246,10 @@ impl Dump {
         &self.entries
     }
 
-    /// Look up an entry by description, namespace, and tag.
-    pub fn lookup_entry(&self, desc: &str, namespace: &str, tag: &str) -> Option<&Entry> {
+    /// Look up an entry by object type, namespace, and tag.
+    pub fn lookup_entry(&self, desc: &ObjectType, namespace: &str, tag: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| {
-            e.desc == desc
+            e.desc == *desc
                 && e.namespace.as_deref() == Some(namespace)
                 && e.tag.as_deref() == Some(tag)
         })
@@ -269,12 +268,12 @@ impl Dump {
             .entries
             .iter()
             .find(|e| {
-                e.desc == constants::TABLE_DATA
+                e.desc == ObjectType::TableData
                     && e.namespace.as_deref() == Some(namespace)
                     && e.tag.as_deref() == Some(table)
             })
             .ok_or_else(|| Error::EntityNotFound {
-                desc: constants::TABLE_DATA.to_string(),
+                desc: ObjectType::TableData,
                 namespace: namespace.to_string(),
                 tag: table.to_string(),
             })?;
@@ -299,7 +298,7 @@ impl Dump {
     pub fn blobs(&self) -> Vec<(i32, &[u8])> {
         let mut result = Vec::new();
         for entry in &self.entries {
-            if (entry.desc == constants::BLOBS || entry.desc == constants::BLOB)
+            if (entry.desc == ObjectType::Blobs || entry.desc == ObjectType::Blob)
                 && let Some(blob_list) = self.blobs.get(&entry.dump_id)
             {
                 for blob in blob_list {
@@ -319,12 +318,12 @@ impl Dump {
         let blobs_dump_id = if let Some(entry) = self
             .entries
             .iter()
-            .find(|e| e.desc == constants::BLOBS && e.had_dumper)
+            .find(|e| e.desc == ObjectType::Blobs && e.had_dumper)
         {
             entry.dump_id
         } else {
             let dump_id =
-                self.add_entry(constants::BLOBS, None, None, None, None, None, None, &[])?;
+                self.add_entry(ObjectType::Blobs, None, None, None, None, None, None, &[])?;
             let entry = self
                 .entries
                 .iter_mut()
@@ -353,7 +352,7 @@ impl Dump {
     #[allow(clippy::too_many_arguments)]
     pub fn add_entry(
         &mut self,
-        desc: &str,
+        desc: ObjectType,
         namespace: Option<&str>,
         tag: Option<&str>,
         owner: Option<&str>,
@@ -365,14 +364,14 @@ impl Dump {
         let dump_id = self.next_dump_id;
         self.next_dump_id += 1;
 
-        let section = constants::section_for_desc(desc);
+        let section = desc.section();
         let entry = Entry {
             dump_id,
             had_dumper: false,
             table_oid: "0".to_string(),
             oid: "0".to_string(),
             tag: tag.map(String::from),
-            desc: desc.to_string(),
+            desc,
             section,
             defn: defn.map(String::from),
             drop_stmt: drop_stmt.map(String::from),
