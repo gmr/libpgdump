@@ -23,9 +23,11 @@ fn test_round_trip_uncompressed() {
     assert_eq!(dump.version(), reloaded.version());
     assert_eq!(dump.entries().len(), reloaded.entries().len());
 
-    // Compare entries
-    for (orig, reload) in dump.entries().iter().zip(reloaded.entries().iter()) {
-        assert_eq!(orig.dump_id, reload.dump_id, "dump_id mismatch");
+    // Compare entries by dump_id (order may differ due to topological sorting)
+    for orig in dump.entries().iter() {
+        let reload = reloaded
+            .get_entry(orig.dump_id)
+            .unwrap_or_else(|| panic!("missing entry with dump_id {}", orig.dump_id));
         assert_eq!(
             orig.desc, reload.desc,
             "desc mismatch for dump_id {}",
