@@ -7,6 +7,8 @@ use crate::constants;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::format::custom::{self, ArchiveData, Blob, Timestamp};
+use crate::format::directory;
+use crate::format::tar;
 use crate::header::Header;
 use crate::types::{CompressionAlgorithm, Format, OffsetState};
 use crate::version::{self, ArchiveVersion};
@@ -26,11 +28,26 @@ pub struct Dump {
 }
 
 impl Dump {
-    /// Load a dump from a file.
+    /// Load a dump from a file or directory.
+    ///
+    /// Automatically detects the format:
+    /// - Directory → directory format (`-Fd`)
+    /// - File starting with `PGDMP` → custom format (`-Fc`)
+    /// - File with ustar header → tar format (`-Ft`)
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let archive = custom::read_archive(&mut reader)?;
+        let path = path.as_ref();
+        let archive = if path.is_dir() {
+            directory::read_archive(path)?
+        } else {
+            match detect_file_format(path)? {
+                Format::Tar => tar::read_archive(path)?,
+                _ => {
+                    let file = File::open(path)?;
+                    let mut reader = BufReader::new(file);
+                    custom::read_archive(&mut reader)?
+                }
+            }
+        };
         Ok(Self::from_archive_data(archive))
     }
 
@@ -112,44 +129,78 @@ impl Dump {
         }
     }
 
-    /// Save the dump to a file.
+    /// Save the dump to a file or directory.
     ///
-    /// Writes to a temporary file first, then atomically renames to the
-    /// target path to avoid leaving a partial/corrupt file on failure.
+    /// For custom format (`-Fc`), writes to a temporary file first, then
+    /// atomically renames to avoid leaving a partial file on failure.
+    /// For directory format (`-Fd`), writes directly to the directory.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let tmp_path = path.with_extension("tmp");
-        let result = (|| {
-            let file = File::create(&tmp_path)?;
-            let mut writer = BufWriter::new(file);
-            let archive = self.to_archive_data();
-            custom::write_archive(&mut writer, &archive)?;
-            writer
-                .into_inner()
-                .map_err(|e| Error::Io(e.into_error()))?
-                .sync_all()?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                std::fs::rename(&tmp_path, path)?;
+        let archive = self.to_archive_data();
+
+        if self.header.format == Format::Directory {
+            directory::write_archive(path, &archive)
+        } else if self.header.format == Format::Tar {
+            tar::write_archive(path, &archive)
+        } else {
+            let tmp_path = path.with_extension("tmp");
+            let result = (|| {
+                let file = File::create(&tmp_path)?;
+                let mut writer = BufWriter::new(file);
+                custom::write_archive(&mut writer, &archive)?;
+                writer
+                    .into_inner()
+                    .map_err(|e| Error::Io(e.into_error()))?
+                    .sync_all()?;
                 Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e)
+            })();
+            match result {
+                Ok(()) => {
+                    std::fs::rename(&tmp_path, path)?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(e)
+                }
             }
         }
     }
 
+    /// Set the output format for writing.
+    ///
+    /// Note: Tar format does not support compression. If compression is set
+    /// when switching to tar format, it will be reset to `None`.
+    pub fn set_format(&mut self, format: Format) {
+        if format == Format::Tar && self.header.compression != CompressionAlgorithm::None {
+            self.header.compression = CompressionAlgorithm::None;
+        }
+        self.header.format = format;
+    }
+
     fn to_archive_data(&self) -> ArchiveData {
+        let mut entries = self.entries.clone();
+
+        // For directory and tar formats, ensure entries have filenames
+        if self.header.format == Format::Directory || self.header.format == Format::Tar {
+            for entry in &mut entries {
+                if entry.filename.is_none() {
+                    if self.data.contains_key(&entry.dump_id) {
+                        entry.filename = Some(format!("{}.dat", entry.dump_id));
+                    } else if self.blobs.contains_key(&entry.dump_id) {
+                        entry.filename = Some(format!("blobs_{}.toc", entry.dump_id));
+                    }
+                }
+            }
+        }
+
         ArchiveData {
             header: self.header.clone(),
             timestamp: self.timestamp.clone(),
             dbname: self.dbname.clone(),
             server_version: self.server_version.clone(),
             dump_version: self.dump_version.clone(),
-            entries: self.entries.clone(),
+            entries,
             data: self.data.clone(),
             blobs: self.blobs.clone(),
         }
@@ -331,6 +382,7 @@ impl Dump {
             dependencies: dependencies.to_vec(),
             data_state: OffsetState::NoData,
             offset: 0,
+            filename: None,
         };
         self.entries.push(entry);
         Ok(dump_id)
@@ -353,6 +405,29 @@ impl Dump {
     pub fn set_compression(&mut self, alg: CompressionAlgorithm) {
         self.header.compression = alg;
     }
+}
+
+/// Detect file format by reading magic bytes.
+/// Custom format starts with "PGDMP"; tar has "ustar" at offset 257.
+fn detect_file_format(path: &Path) -> Result<Format> {
+    use std::io::Read;
+
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; 265];
+    let n = file.read(&mut buf)?;
+
+    if n >= 5 && &buf[..5] == b"PGDMP" {
+        return Ok(Format::Custom);
+    }
+    if n >= 263 && &buf[257..263] == b"ustar\0" {
+        return Ok(Format::Tar);
+    }
+    // GNU tar variant
+    if n >= 265 && &buf[257..265] == b"ustar  \0" {
+        return Ok(Format::Tar);
+    }
+
+    Ok(Format::Custom) // default fallback
 }
 
 fn now_timestamp() -> Timestamp {

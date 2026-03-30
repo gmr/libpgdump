@@ -277,6 +277,7 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
         dependencies,
         data_state,
         offset,
+        filename: None,
     })
 }
 
@@ -707,6 +708,7 @@ mod tests {
                 dependencies: vec![],
                 data_state: OffsetState::NoData,
                 offset: 0,
+                filename: None,
             }],
             data: HashMap::new(),
             blobs: HashMap::new(),
@@ -758,6 +760,7 @@ mod tests {
                 dependencies: vec![],
                 data_state: OffsetState::NotSet,
                 offset: 0,
+                filename: None,
             }],
             data: HashMap::new(),
             blobs: HashMap::new(),

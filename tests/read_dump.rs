@@ -184,3 +184,70 @@ fn test_entry_dependencies() {
     let has_deps = dump.entries().iter().any(|e| !e.dependencies.is_empty());
     assert!(has_deps, "some entries should have dependencies");
 }
+
+#[test]
+fn test_load_directory() {
+    let Some(path) = fixture_path("dump.directory") else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let dump = libpgdump::load(&path).expect("failed to load directory dump");
+
+    assert!(!dump.dbname().is_empty());
+    assert!(!dump.server_version().is_empty());
+    assert!(!dump.entries().is_empty());
+    assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::None);
+
+    let table_data_count = dump
+        .entries()
+        .iter()
+        .filter(|e| e.desc == "TABLE DATA")
+        .count();
+    assert!(
+        table_data_count > 0,
+        "directory dump should have TABLE DATA entries"
+    );
+}
+
+#[test]
+fn test_load_directory_compressed() {
+    let Some(path) = fixture_path("dump.directory-compressed") else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let dump = libpgdump::load(&path).expect("failed to load compressed directory dump");
+
+    assert!(!dump.dbname().is_empty());
+    assert!(!dump.entries().is_empty());
+    assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::Gzip);
+
+    let rows: Vec<&str> = dump
+        .table_data("public", "pgbench_accounts")
+        .expect("failed to get pgbench_accounts data from compressed directory dump")
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "compressed directory dump should return table data"
+    );
+}
+
+#[test]
+fn test_read_table_data_directory() {
+    let Some(path) = fixture_path("dump.directory") else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let dump = libpgdump::load(&path).expect("failed to load dump");
+
+    let rows: Vec<&str> = dump
+        .table_data("public", "pgbench_accounts")
+        .expect("failed to get pgbench_accounts data")
+        .collect();
+    assert!(!rows.is_empty(), "pgbench_accounts should have rows");
+    for row in &rows {
+        assert!(
+            row.contains('\t'),
+            "rows should be tab-separated COPY format"
+        );
+    }
+}

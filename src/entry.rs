@@ -20,8 +20,12 @@ pub struct Entry {
     pub owner: Option<String>,
     pub with_oids: bool,
     pub dependencies: Vec<i32>,
+    /// Custom format: offset state (set, not set, no data).
     pub data_state: OffsetState,
+    /// Custom format: byte offset of this entry's data in the archive file.
     pub offset: u64,
+    /// Directory/tar format: relative filename for this entry's data file.
+    pub filename: Option<String>,
 }
 
 impl Entry {
