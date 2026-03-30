@@ -110,12 +110,33 @@ impl Dump {
     }
 
     /// Save the dump to a file.
+    ///
+    /// Writes to a temporary file first, then atomically renames to the
+    /// target path to avoid leaving a partial/corrupt file on failure.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        let archive = self.to_archive_data();
-        custom::write_archive(&mut writer, &archive)?;
-        Ok(())
+        let path = path.as_ref();
+        let tmp_path = path.with_extension("tmp");
+        let result = (|| {
+            let file = File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            let archive = self.to_archive_data();
+            custom::write_archive(&mut writer, &archive)?;
+            writer
+                .into_inner()
+                .map_err(|e| Error::Io(e.into_error()))?
+                .sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                std::fs::rename(&tmp_path, path)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
 
     fn to_archive_data(&self) -> ArchiveData {

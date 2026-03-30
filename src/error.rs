@@ -1,5 +1,3 @@
-use std::fmt;
-
 use crate::version::ArchiveVersion;
 
 #[derive(Debug, thiserror::Error)]
@@ -40,12 +38,6 @@ pub enum Error {
 
     #[error("invalid UTF-8 string: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
-}
-
-impl fmt::Display for ArchiveVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.rev)
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

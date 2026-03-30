@@ -11,6 +11,12 @@ impl ArchiveVersion {
     }
 }
 
+impl std::fmt::Display for ArchiveVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.rev)
+    }
+}
+
 pub const MIN_VERSION: ArchiveVersion = ArchiveVersion::new(1, 12, 0);
 pub const MAX_VERSION: ArchiveVersion = ArchiveVersion::new(1, 16, 0);
 

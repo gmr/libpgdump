@@ -173,10 +173,10 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     let tag = read_string(r, int_size)?;
     let desc = read_string(r, int_size)?.unwrap_or_default();
 
-    // Section integer is in the file (v>=1.11) but we derive it from desc
+    // Section integer is in the file (v>=1.11)
     let section = if version >= ArchiveVersion::new(1, 11, 0) {
         let sec_int = read_int(r, int_size)?;
-        Section::from_int(sec_int)
+        Section::from_int(sec_int).unwrap_or(Section::None)
     } else {
         Section::None
     };
@@ -285,10 +285,16 @@ fn read_data_blocks<R: Read + Seek>(
 
         r.seek(SeekFrom::Start(entry.offset))?;
 
-        // Read block header
+        // Read and validate block header
         let block_type_byte = read_byte(r)?;
         let block_type = BlockType::from_byte(block_type_byte);
-        let _block_dump_id = read_int(r, header.int_size)?;
+        let block_dump_id = read_int(r, header.int_size)?;
+        if block_dump_id != entry.dump_id {
+            return Err(Error::DataIntegrity(format!(
+                "block dump_id {block_dump_id} does not match entry dump_id {}",
+                entry.dump_id
+            )));
+        }
 
         // Read data based on block type
         let raw_data = if block_type == Some(BlockType::Blobs) {

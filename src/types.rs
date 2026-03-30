@@ -7,12 +7,13 @@ pub enum Section {
 }
 
 impl Section {
-    pub(crate) fn from_int(value: i32) -> Self {
+    pub(crate) fn from_int(value: i32) -> Option<Self> {
         match value {
-            2 => Self::PreData,
-            3 => Self::Data,
-            4 => Self::PostData,
-            _ => Self::None,
+            1 => Some(Self::None),
+            2 => Some(Self::PreData),
+            3 => Some(Self::Data),
+            4 => Some(Self::PostData),
+            _ => None,
         }
     }
 

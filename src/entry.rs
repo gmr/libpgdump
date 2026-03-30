@@ -25,8 +25,11 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Returns the section this entry belongs to, derived from its description.
-    pub fn default_section(&self) -> Section {
+    /// Computes the section from `self.desc` via [`section_for_desc`].
+    ///
+    /// This is a derived value and may differ from [`Entry::section`], which
+    /// holds the section as read from the archive file.
+    pub fn computed_section(&self) -> Section {
         section_for_desc(&self.desc)
     }
 }

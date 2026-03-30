@@ -1,9 +1,5 @@
-use std::path::Path;
-
-fn fixture_path(name: &str) -> Option<std::path::PathBuf> {
-    let path = Path::new("build/data").join(name);
-    if path.exists() { Some(path) } else { None }
-}
+mod common;
+use common::fixture_path;
 
 #[test]
 fn test_round_trip_uncompressed() {
