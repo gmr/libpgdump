@@ -271,15 +271,56 @@ fn read_data_blocks<R: Read + Seek>(
 
         // Read block header
         let block_type_byte = read_byte(r)?;
-        let _block_type = BlockType::from_byte(block_type_byte);
+        let block_type = BlockType::from_byte(block_type_byte);
         let _block_dump_id = read_int(r, header.int_size)?;
 
-        // Read compressed data chunks
-        let raw_data = read_compressed_data(r, header)?;
+        // Read data based on block type
+        let raw_data = if block_type == Some(BlockType::Blobs) {
+            read_blob_data(r, header)?
+        } else {
+            read_compressed_data(r, header)?
+        };
         data_map.insert(entry.dump_id, raw_data);
     }
 
     Ok(data_map)
+}
+
+/// Read blob data from a BLK_BLOBS block.
+///
+/// Structure: oid(int) compressed_chunks oid(int) compressed_chunks ... 0(int)
+/// Each blob's data is preceded by its OID. A zero OID terminates the sequence.
+fn read_blob_data<R: Read + Seek>(r: &mut R, header: &Header) -> Result<Vec<u8>> {
+    // Capture the raw bytes of the blob block (everything between the block header
+    // and the terminating zero OID) so we can round-trip them faithfully when writing
+    // as BLK_BLOBS.
+    let start = r.stream_position()?;
+
+    // Skip past all blobs to find the end
+    loop {
+        let oid = read_int(r, header.int_size)?;
+        if oid == 0 {
+            break;
+        }
+        // Skip compressed chunks for this blob
+        loop {
+            let chunk_size = read_int(r, header.int_size)?;
+            if chunk_size <= 0 {
+                break;
+            }
+            r.seek(SeekFrom::Current(chunk_size as i64))?;
+        }
+    }
+
+    let end = r.stream_position()?;
+    let len = (end - start) as usize;
+
+    // Seek back and read the raw bytes
+    r.seek(SeekFrom::Start(start))?;
+    let mut raw = vec![0u8; len];
+    r.read_exact(&mut raw)?;
+
+    Ok(raw)
 }
 
 /// Read and decompress a sequence of data chunks.
@@ -485,6 +526,13 @@ fn write_data_block<W: std::io::Write>(
 ) -> Result<()> {
     write_byte(w, block_type as u8)?;
     write_int(w, dump_id, header.int_size)?;
+
+    // BLK_BLOBS data contains the raw oid+chunks structure from reading;
+    // write it verbatim (it already includes compression and terminators).
+    if block_type == BlockType::Blobs {
+        w.write_all(data)?;
+        return Ok(());
+    }
 
     if data.is_empty() {
         write_int(w, 0, header.int_size)?;
