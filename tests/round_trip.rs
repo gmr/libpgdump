@@ -358,3 +358,47 @@ fn test_round_trip_directory_format() {
     assert_eq!(blobs[0].0, 99001);
     assert_eq!(blobs[0].1, b"directory blob data");
 }
+
+#[test]
+fn test_round_trip_tar_format() {
+    let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("failed to create dump");
+    dump.set_format(libpgdump::Format::Tar);
+
+    let data_id = dump
+        .add_entry(
+            "TABLE DATA",
+            Some("public"),
+            Some("items"),
+            Some("postgres"),
+            None,
+            None,
+            Some("COPY public.items (id, value) FROM stdin;\n"),
+            &[],
+        )
+        .expect("failed to add data entry");
+
+    dump.set_entry_data(data_id, b"1\tAlice\n2\tBob\n".to_vec())
+        .expect("failed to set data");
+
+    dump.add_blob(42, b"tar blob data".to_vec())
+        .expect("failed to add blob");
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save tar dump");
+
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload tar dump");
+    assert_eq!(reloaded.dbname(), "testdb");
+
+    let rows: Vec<&str> = reloaded
+        .table_data("public", "items")
+        .expect("failed to get table data")
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], "1\tAlice");
+    assert_eq!(rows[1], "2\tBob");
+
+    let blobs = reloaded.blobs();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].0, 42);
+    assert_eq!(blobs[0].1, b"tar blob data");
+}

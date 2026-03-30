@@ -8,6 +8,7 @@ use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::format::custom::{self, ArchiveData, Blob, Timestamp};
 use crate::format::directory;
+use crate::format::tar;
 use crate::header::Header;
 use crate::types::{CompressionAlgorithm, Format, OffsetState};
 use crate::version::{self, ArchiveVersion};
@@ -29,16 +30,23 @@ pub struct Dump {
 impl Dump {
     /// Load a dump from a file or directory.
     ///
-    /// Automatically detects the format: if `path` is a directory, reads
-    /// directory format (`-Fd`); otherwise reads custom format (`-Fc`).
+    /// Automatically detects the format:
+    /// - Directory → directory format (`-Fd`)
+    /// - File starting with `PGDMP` → custom format (`-Fc`)
+    /// - File with ustar header → tar format (`-Ft`)
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let archive = if path.is_dir() {
             directory::read_archive(path)?
         } else {
-            let file = File::open(path)?;
-            let mut reader = BufReader::new(file);
-            custom::read_archive(&mut reader)?
+            match detect_file_format(path)? {
+                Format::Tar => tar::read_archive(path)?,
+                _ => {
+                    let file = File::open(path)?;
+                    let mut reader = BufReader::new(file);
+                    custom::read_archive(&mut reader)?
+                }
+            }
         };
         Ok(Self::from_archive_data(archive))
     }
@@ -132,6 +140,8 @@ impl Dump {
 
         if self.header.format == Format::Directory {
             directory::write_archive(path, &archive)
+        } else if self.header.format == Format::Tar {
+            tar::write_archive(path, &archive)
         } else {
             let tmp_path = path.with_extension("tmp");
             let result = (|| {
@@ -165,8 +175,8 @@ impl Dump {
     fn to_archive_data(&self) -> ArchiveData {
         let mut entries = self.entries.clone();
 
-        // For directory format, ensure entries have filenames
-        if self.header.format == Format::Directory {
+        // For directory and tar formats, ensure entries have filenames
+        if self.header.format == Format::Directory || self.header.format == Format::Tar {
             for entry in &mut entries {
                 if entry.filename.is_none() {
                     if self.data.contains_key(&entry.dump_id) {
@@ -389,6 +399,29 @@ impl Dump {
     pub fn set_compression(&mut self, alg: CompressionAlgorithm) {
         self.header.compression = alg;
     }
+}
+
+/// Detect file format by reading magic bytes.
+/// Custom format starts with "PGDMP"; tar has "ustar" at offset 257.
+fn detect_file_format(path: &Path) -> Result<Format> {
+    use std::io::Read;
+
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; 265];
+    let n = file.read(&mut buf)?;
+
+    if n >= 5 && &buf[..5] == b"PGDMP" {
+        return Ok(Format::Custom);
+    }
+    if n >= 263 && &buf[257..263] == b"ustar\0" {
+        return Ok(Format::Tar);
+    }
+    // GNU tar variant
+    if n >= 265 && &buf[257..265] == b"ustar  \0" {
+        return Ok(Format::Tar);
+    }
+
+    Ok(Format::Custom) // default fallback
 }
 
 fn now_timestamp() -> Timestamp {
