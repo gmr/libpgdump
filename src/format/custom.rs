@@ -287,7 +287,9 @@ fn read_data_blocks<R: Read + Seek>(
 
         // Read and validate block header
         let block_type_byte = read_byte(r)?;
-        let block_type = BlockType::from_byte(block_type_byte);
+        let block_type = BlockType::from_byte(block_type_byte).ok_or_else(|| {
+            Error::DataIntegrity(format!("unknown block type: {block_type_byte}"))
+        })?;
         let block_dump_id = read_int(r, header.int_size)?;
         if block_dump_id != entry.dump_id {
             return Err(Error::DataIntegrity(format!(
@@ -297,10 +299,9 @@ fn read_data_blocks<R: Read + Seek>(
         }
 
         // Read data based on block type
-        let raw_data = if block_type == Some(BlockType::Blobs) {
-            read_blob_data(r, header)?
-        } else {
-            read_compressed_data(r, header)?
+        let raw_data = match block_type {
+            BlockType::Blobs => read_blob_data(r, header)?,
+            BlockType::Data => read_compressed_data(r, header)?,
         };
         data_map.insert(entry.dump_id, raw_data);
     }
@@ -327,8 +328,13 @@ fn read_blob_data<R: Read + Seek>(r: &mut R, header: &Header) -> Result<Vec<u8>>
         // Skip compressed chunks for this blob
         loop {
             let chunk_size = read_int(r, header.int_size)?;
-            if chunk_size <= 0 {
+            if chunk_size == 0 {
                 break;
+            }
+            if chunk_size < 0 {
+                return Err(Error::DataIntegrity(format!(
+                    "negative chunk size: {chunk_size}"
+                )));
             }
             r.seek(SeekFrom::Current(chunk_size as i64))?;
         }
@@ -354,8 +360,13 @@ fn read_compressed_data<R: Read>(r: &mut R, header: &Header) -> Result<Vec<u8>> 
 
     loop {
         let chunk_size = read_int(r, header.int_size)?;
-        if chunk_size <= 0 {
+        if chunk_size == 0 {
             break;
+        }
+        if chunk_size < 0 {
+            return Err(Error::DataIntegrity(format!(
+                "negative chunk size: {chunk_size}"
+            )));
         }
         let mut chunk = vec![0u8; chunk_size as usize];
         r.read_exact(&mut chunk)?;
@@ -404,9 +415,7 @@ pub fn write_archive<W: std::io::Write + Seek>(w: &mut W, archive: &ArchiveData)
     // Write data blocks and record actual offsets
     let mut actual_offsets: HashMap<i32, u64> = HashMap::new();
     for entry in &archive.entries {
-        if let Some(data) = archive.data.get(&entry.dump_id)
-            && !data.is_empty()
-        {
+        if let Some(data) = archive.data.get(&entry.dump_id) {
             let pos = w.stream_position()?;
             actual_offsets.insert(entry.dump_id, pos);
 
@@ -449,11 +458,13 @@ fn write_header<W: std::io::Write>(w: &mut W, header: &Header) -> Result<()> {
     if header.version >= ArchiveVersion::new(1, 15, 0) {
         write_byte(w, header.compression as u8)?;
     } else {
-        // Pre-1.15: write compression level as an integer
+        // Pre-1.15: only none and gzip are valid; write compression level
         let level = match header.compression {
             CompressionAlgorithm::None => 0,
-            CompressionAlgorithm::Gzip => 6, // default compression level
-            _ => 0,
+            CompressionAlgorithm::Gzip => 6,
+            other => {
+                return Err(Error::UnsupportedCompression(other as u8));
+            }
         };
         write_int(w, level, header.int_size)?;
     }
