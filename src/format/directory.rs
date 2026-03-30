@@ -97,11 +97,12 @@ pub fn write_archive(dir: &Path, archive: &ArchiveData) -> Result<()> {
         toc_header.int_size,
     )?;
 
-    write_int(
-        &mut toc_file,
-        archive.entries.len() as i32,
-        toc_header.int_size,
-    )?;
+    let entry_count: i32 = archive
+        .entries
+        .len()
+        .try_into()
+        .map_err(|_| Error::DataIntegrity("too many entries for i32".to_string()))?;
+    write_int(&mut toc_file, entry_count, toc_header.int_size)?;
 
     for entry in &archive.entries {
         write_entry(&mut toc_file, entry, &toc_header)?;
@@ -516,6 +517,11 @@ fn read_blob_toc(dir: &Path, _header: &Header, toc_filename: &str) -> Result<Vec
             let raw = fs::read(&file_path)?;
             let data = decompress_file_data(&raw, file_compression)?;
             blobs.push(Blob { oid, data });
+        } else {
+            return Err(Error::DataIntegrity(format!(
+                "blob data file not found: {blob_filename} in {}",
+                dir.display()
+            )));
         }
     }
 

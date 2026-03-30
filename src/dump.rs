@@ -168,7 +168,13 @@ impl Dump {
     }
 
     /// Set the output format for writing.
+    ///
+    /// Note: Tar format does not support compression. If compression is set
+    /// when switching to tar format, it will be reset to `None`.
     pub fn set_format(&mut self, format: Format) {
+        if format == Format::Tar && self.header.compression != CompressionAlgorithm::None {
+            self.header.compression = CompressionAlgorithm::None;
+        }
         self.header.format = format;
     }
 

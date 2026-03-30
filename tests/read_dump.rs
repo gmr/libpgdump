@@ -220,6 +220,15 @@ fn test_load_directory_compressed() {
     assert!(!dump.dbname().is_empty());
     assert!(!dump.entries().is_empty());
     assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::Gzip);
+
+    let rows: Vec<&str> = dump
+        .table_data("public", "pgbench_accounts")
+        .expect("failed to get pgbench_accounts data from compressed directory dump")
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "compressed directory dump should return table data"
+    );
 }
 
 #[test]
