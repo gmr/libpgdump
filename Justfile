@@ -135,6 +135,8 @@ bootstrap:
     docker_exec /usr/bin/pg_dump -Fc -U postgres -f /data/dump.no-data -d postgres --compress=0 -s
     docker_exec /usr/bin/pg_dump -Fc -U postgres -f /data/dump.data-only -d postgres --compress=0 -a
     docker_exec /usr/bin/pg_dump -Fc -U postgres -f /data/dump.inserts -d postgres --compress=0 --inserts
+    docker_exec /usr/bin/pg_dump -Fd -U postgres -f /data/dump.directory -d postgres --compress=0
+    docker_exec /usr/bin/pg_dump -Fd -U postgres -f /data/dump.directory-compressed -d postgres --compress=9
     echo ' done.'
 
     printf "Fixing permissions..."
@@ -163,6 +165,8 @@ fixtures:
     docker_exec /usr/bin/pg_dump -Fc -U postgres -f /data/dump.no-data -d postgres --compress=0 -s
     docker_exec /usr/bin/pg_dump -Fc -U postgres -f /data/dump.data-only -d postgres --compress=0 -a
     docker_exec /usr/bin/pg_dump -Fc -U postgres -f /data/dump.inserts -d postgres --compress=0 --inserts
+    docker_exec /usr/bin/pg_dump -Fd -U postgres -f /data/dump.directory -d postgres --compress=0
+    docker_exec /usr/bin/pg_dump -Fd -U postgres -f /data/dump.directory-compressed -d postgres --compress=9
     echo ' done.'
 
     printf "Fixing permissions..."
