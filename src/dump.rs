@@ -260,6 +260,11 @@ impl Dump {
         self.entries.iter().find(|e| e.dump_id == dump_id)
     }
 
+    /// Get a mutable reference to an entry by dump_id.
+    pub fn get_entry_mut(&mut self, dump_id: i32) -> Option<&mut Entry> {
+        self.entries.iter_mut().find(|e| e.dump_id == dump_id)
+    }
+
     /// Iterate over table data rows for the given namespace and table.
     ///
     /// Each yielded item is a line from the COPY data (without the trailing newline).
