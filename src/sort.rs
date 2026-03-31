@@ -251,6 +251,44 @@ mod tests {
     }
 
     #[test]
+    fn test_sort_namespace_then_tag_across_equal_priority_types() {
+        // Table and ForeignTable share the same priority (22).
+        // When priority is equal, entries should still sort by
+        // namespace then tag, regardless of ObjectType variant.
+        let mut entries = vec![
+            make_entry(
+                1,
+                ObjectType::ForeignTable,
+                Some("public"),
+                Some("beta"),
+                vec![],
+            ),
+            make_entry(2, ObjectType::Table, Some("app"), Some("alpha"), vec![]),
+            make_entry(3, ObjectType::Table, Some("public"), Some("alpha"), vec![]),
+            make_entry(
+                4,
+                ObjectType::ForeignTable,
+                Some("app"),
+                Some("zeta"),
+                vec![],
+            ),
+        ];
+
+        sort_entries(&mut entries);
+
+        // All four share priority 22, so ordering is by namespace
+        // then tag: app.alpha, app.zeta, public.alpha, public.beta
+        assert_eq!(entries[0].namespace.as_deref(), Some("app"));
+        assert_eq!(entries[0].tag.as_deref(), Some("alpha"));
+        assert_eq!(entries[1].namespace.as_deref(), Some("app"));
+        assert_eq!(entries[1].tag.as_deref(), Some("zeta"));
+        assert_eq!(entries[2].namespace.as_deref(), Some("public"));
+        assert_eq!(entries[2].tag.as_deref(), Some("alpha"));
+        assert_eq!(entries[3].namespace.as_deref(), Some("public"));
+        assert_eq!(entries[3].tag.as_deref(), Some("beta"));
+    }
+
+    #[test]
     fn test_sort_handles_empty() {
         let mut entries: Vec<Entry> = vec![];
         sort_entries(&mut entries);
