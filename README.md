@@ -107,6 +107,7 @@ match libpgdump::load("backup.dump") {
 - **Version-aware parsing**: handles all format variations across versions
 - **60+ object types**: tables, indexes, views, functions, constraints, extensions, etc.
 - **Large object (blob) support**
+- **Weighted topological sort**: entries are sorted on save matching pg_dump's dependency-aware ordering
 - **Programmatic dump creation**: build dumps from scratch with the builder API
 
 ## Format details
