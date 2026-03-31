@@ -1,5 +1,4 @@
-use crate::constants::section_for_desc;
-use crate::types::{OffsetState, Section};
+use crate::types::{ObjectType, OffsetState, Section};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -8,7 +7,7 @@ pub struct Entry {
     pub table_oid: String,
     pub oid: String,
     pub tag: Option<String>,
-    pub desc: String,
+    pub desc: ObjectType,
     pub section: Section,
     pub defn: Option<String>,
     pub drop_stmt: Option<String>,
@@ -29,11 +28,11 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Computes the section from `self.desc` via [`section_for_desc`].
+    /// Computes the section from the object type.
     ///
     /// This is a derived value and may differ from [`Entry::section`], which
     /// holds the section as read from the archive file.
     pub fn computed_section(&self) -> Section {
-        section_for_desc(&self.desc)
+        self.desc.section()
     }
 }

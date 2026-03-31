@@ -1,5 +1,54 @@
 mod common;
 use common::fixture_path;
+use libpgdump::ObjectType;
+
+#[test]
+fn test_get_entry_mut() {
+    let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("failed to create dump");
+
+    let table_id = dump
+        .add_entry(
+            ObjectType::Table,
+            Some("public"),
+            Some("widgets"),
+            Some("postgres"),
+            Some("CREATE TABLE public.widgets (id int);\n"),
+            None,
+            None,
+            &[],
+        )
+        .expect("failed to add entry");
+
+    // Verify initial state
+    let entry = dump.get_entry(table_id).expect("entry not found");
+    assert_eq!(entry.tableam, None);
+    assert_eq!(entry.owner, Some("postgres".to_string()));
+
+    // Mutate via get_entry_mut
+    let entry = dump.get_entry_mut(table_id).expect("entry not found");
+    entry.tableam = Some("heap".to_string());
+    entry.tablespace = Some("fast_storage".to_string());
+
+    // Verify mutation persisted
+    let entry = dump.get_entry(table_id).expect("entry not found");
+    assert_eq!(entry.tableam, Some("heap".to_string()));
+    assert_eq!(entry.tablespace, Some("fast_storage".to_string()));
+
+    // Save and reload to verify fields survive round-trip
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+    let entry = reloaded.get_entry(table_id).expect("entry not found");
+    assert_eq!(entry.tableam, Some("heap".to_string()));
+    assert_eq!(entry.tablespace, Some("fast_storage".to_string()));
+}
+
+#[test]
+fn test_get_entry_mut_not_found() {
+    let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("failed to create dump");
+    assert!(dump.get_entry_mut(9999).is_none());
+}
 
 #[test]
 fn test_round_trip_uncompressed() {
@@ -80,7 +129,7 @@ fn test_round_trip_new_dump() {
     // Add a table entry
     let table_id = dump
         .add_entry(
-            "TABLE",
+            ObjectType::Table,
             Some("public"),
             Some("users"),
             Some("postgres"),
@@ -94,7 +143,7 @@ fn test_round_trip_new_dump() {
     // Add a table data entry
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("users"),
             Some("postgres"),
@@ -136,7 +185,7 @@ fn test_round_trip_compressed_new_dump() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -175,7 +224,7 @@ fn test_round_trip_lz4_new_dump() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -214,7 +263,7 @@ fn test_round_trip_zstd_new_dump() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -304,7 +353,7 @@ fn test_round_trip_directory_format() {
 
     let table_id = dump
         .add_entry(
-            "TABLE",
+            ObjectType::Table,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -317,7 +366,7 @@ fn test_round_trip_directory_format() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),
@@ -368,7 +417,7 @@ fn test_round_trip_tar_format() {
 
     let data_id = dump
         .add_entry(
-            "TABLE DATA",
+            ObjectType::TableData,
             Some("public"),
             Some("items"),
             Some("postgres"),

@@ -1,3 +1,4 @@
+use crate::types::ObjectType;
 use crate::version::ArchiveVersion;
 
 #[derive(Debug, thiserror::Error)]
@@ -19,7 +20,7 @@ pub enum Error {
 
     #[error("entity not found: {desc} {namespace}.{tag}")]
     EntityNotFound {
-        desc: String,
+        desc: ObjectType,
         namespace: String,
         tag: String,
     },
