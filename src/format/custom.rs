@@ -489,8 +489,7 @@ fn write_entry<W: std::io::Write + Seek>(w: &mut W, entry: &Entry, header: &Head
     write_string(w, Some(&entry.table_oid), int_size)?;
     write_string(w, Some(&entry.oid), int_size)?;
     write_string(w, entry.tag.as_deref(), int_size)?;
-    let desc_str = entry.desc.to_string();
-    write_string(w, Some(&desc_str), int_size)?;
+    write_string(w, Some(entry.desc.as_str()), int_size)?;
 
     if version >= ArchiveVersion::new(1, 11, 0) {
         write_int(w, entry.section.to_int(), int_size)?;
