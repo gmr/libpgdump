@@ -16,6 +16,10 @@ use std::collections::BinaryHeap;
 use crate::entry::Entry;
 
 /// Compare `Option<String>` with `Some` sorting before `None`.
+///
+/// This is the inverse of Rust's default `Option::cmp` (which puts `None`
+/// first).  pg_dump sorts entries with a namespace/tag before those without,
+/// so `Some` must compare as less than `None`.
 fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) => a.cmp(b),
