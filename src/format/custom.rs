@@ -181,7 +181,9 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     let table_oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let tag = read_string(r, int_size)?;
-    let desc: ObjectType = read_string(r, int_size)?.unwrap_or_default().into();
+    let desc: ObjectType = read_string(r, int_size)?
+        .ok_or_else(|| Error::DataIntegrity("entry has no descriptor".into()))?
+        .into();
 
     // Section integer is in the file (v>=1.11)
     let section = if version >= ArchiveVersion::new(1, 11, 0) {

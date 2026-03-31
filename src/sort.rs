@@ -30,11 +30,9 @@ fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
 /// This mirrors `DOTypeNameCompare` in pg_dump_sort.c.
 fn entry_cmp(a: &Entry, b: &Entry) -> std::cmp::Ordering {
     a.desc
-        .priority()
-        .cmp(&b.desc.priority())
+        .cmp(&b.desc)
         .then_with(|| cmp_opt_str(&a.namespace, &b.namespace))
         .then_with(|| cmp_opt_str(&a.tag, &b.tag))
-        .then_with(|| a.desc.to_string().cmp(&b.desc.to_string()))
 }
 
 /// Sort entries using the same two-phase strategy as pg_dump:

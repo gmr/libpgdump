@@ -264,7 +264,9 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     let table_oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let oid = read_string(r, int_size)?.unwrap_or_else(|| "0".to_string());
     let tag = read_string(r, int_size)?;
-    let desc: ObjectType = read_string(r, int_size)?.unwrap_or_default().into();
+    let desc: ObjectType = read_string(r, int_size)?
+        .ok_or_else(|| Error::DataIntegrity("entry has no descriptor".into()))?
+        .into();
 
     let section = if version >= ArchiveVersion::new(1, 11, 0) {
         let sec_int = read_int(r, int_size)?;
@@ -680,6 +682,59 @@ mod tests {
         assert_eq!(parsed.dbname, "testdb");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].desc, ObjectType::Encoding);
+    }
+
+    #[test]
+    fn test_directory_round_trip_unknown_desc() {
+        let archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: Timestamp {
+                second: 0,
+                minute: 0,
+                hour: 0,
+                day: 1,
+                month: 0,
+                year: 125,
+                is_dst: 0,
+            },
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: false,
+                table_oid: "0".to_string(),
+                oid: "0".to_string(),
+                tag: Some("future_thing".to_string()),
+                desc: ObjectType::Other("FUTURE TYPE".into()),
+                section: Section::None,
+                defn: Some("CREATE FUTURE TYPE future_thing;\n".to_string()),
+                drop_stmt: None,
+                copy_stmt: None,
+                namespace: None,
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: None,
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NoData,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_archive(tmp.path(), &archive).unwrap();
+
+        let parsed = read_archive(tmp.path()).unwrap();
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(
+            parsed.entries[0].desc,
+            ObjectType::Other("FUTURE TYPE".into())
+        );
     }
 
     #[test]

@@ -193,7 +193,7 @@ impl ObjectType {
             Self::Default | Self::SequenceOwnedBy => 24,
             Self::TableData => 25,
             Self::SequenceSet => 26,
-            Self::LargeObject | Self::Blob | Self::BlobMetadata => 27,
+            Self::LargeObject | Self::Blob | Self::BlobMetadata | Self::PgLargeobjectMetadata => 27,
             Self::Blobs | Self::PgLargeobject => 28,
             Self::StatisticsData => 29,
             Self::CheckConstraint | Self::Constraint => 30,
@@ -215,9 +215,22 @@ impl ObjectType {
             Self::EventTrigger => 46,
             Self::Acl | Self::Comment | Self::SecurityLabel => 47,
             Self::Group | Self::Role | Self::User | Self::UserMapping | Self::Tablespace => 48,
-            Self::PgLargeobjectMetadata => 27,
             Self::Other(_) => 0,
         }
+    }
+}
+
+impl PartialOrd for ObjectType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ObjectType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority()
+            .cmp(&other.priority())
+            .then_with(|| self.to_string().cmp(&other.to_string()))
     }
 }
 
@@ -301,9 +314,9 @@ impl std::fmt::Display for ObjectType {
     }
 }
 
-impl From<&str> for ObjectType {
-    fn from(s: &str) -> Self {
-        match s {
+impl ObjectType {
+    fn parse_known(s: &str) -> Option<Self> {
+        Some(match s {
             "ACCESS METHOD" => Self::AccessMethod,
             "ACL" => Self::Acl,
             "AGGREGATE" => Self::Aggregate,
@@ -376,89 +389,20 @@ impl From<&str> for ObjectType {
             "USER" => Self::User,
             "USER MAPPING" => Self::UserMapping,
             "VIEW" => Self::View,
-            other => Self::Other(other.to_string()),
-        }
+            _ => return None,
+        })
+    }
+}
+
+impl From<&str> for ObjectType {
+    fn from(s: &str) -> Self {
+        Self::parse_known(s).unwrap_or_else(|| Self::Other(s.to_string()))
     }
 }
 
 impl From<String> for ObjectType {
     fn from(s: String) -> Self {
-        // Try the known variants first, only allocate for Other
-        match s.as_str() {
-            "ACCESS METHOD" => Self::AccessMethod,
-            "ACL" => Self::Acl,
-            "AGGREGATE" => Self::Aggregate,
-            "BLOB" => Self::Blob,
-            "BLOB METADATA" => Self::BlobMetadata,
-            "BLOBS" => Self::Blobs,
-            "CAST" => Self::Cast,
-            "CHECK CONSTRAINT" => Self::CheckConstraint,
-            "COLLATION" => Self::Collation,
-            "COMMENT" => Self::Comment,
-            "CONSTRAINT" => Self::Constraint,
-            "CONVERSION" => Self::Conversion,
-            "DATABASE" => Self::Database,
-            "DATABASE PROPERTIES" => Self::DatabaseProperties,
-            "DEFAULT" => Self::Default,
-            "DEFAULT ACL" => Self::DefaultAcl,
-            "DOMAIN" => Self::Domain,
-            "ENCODING" => Self::Encoding,
-            "EVENT TRIGGER" => Self::EventTrigger,
-            "EXTENSION" => Self::Extension,
-            "FK CONSTRAINT" => Self::FkConstraint,
-            "FOREIGN DATA WRAPPER" => Self::ForeignDataWrapper,
-            "FOREIGN SERVER" => Self::ForeignServer,
-            "FOREIGN TABLE" => Self::ForeignTable,
-            "FUNCTION" => Self::Function,
-            "GROUP" => Self::Group,
-            "INDEX" => Self::Index,
-            "INDEX ATTACH" => Self::IndexAttach,
-            "LARGE OBJECT" => Self::LargeObject,
-            "MATERIALIZED VIEW" => Self::MaterializedView,
-            "MATERIALIZED VIEW DATA" => Self::MaterializedViewData,
-            "OPERATOR" => Self::Operator,
-            "OPERATOR CLASS" => Self::OperatorClass,
-            "OPERATOR FAMILY" => Self::OperatorFamily,
-            "pg_largeobject" => Self::PgLargeobject,
-            "pg_largeobject_metadata" => Self::PgLargeobjectMetadata,
-            "POLICY" => Self::Policy,
-            "PROCEDURE" => Self::Procedure,
-            "PROCEDURAL LANGUAGE" => Self::ProceduralLanguage,
-            "PUBLICATION" => Self::Publication,
-            "PUBLICATION TABLE" => Self::PublicationTable,
-            "PUBLICATION TABLES IN SCHEMA" => Self::PublicationTablesInSchema,
-            "ROLE" => Self::Role,
-            "ROW SECURITY" => Self::RowSecurity,
-            "RULE" => Self::Rule,
-            "SCHEMA" => Self::Schema,
-            "SEARCHPATH" => Self::SearchPath,
-            "SECURITY LABEL" => Self::SecurityLabel,
-            "SEQUENCE" => Self::Sequence,
-            "SEQUENCE OWNED BY" => Self::SequenceOwnedBy,
-            "SEQUENCE SET" => Self::SequenceSet,
-            "SERVER" => Self::Server,
-            "SHELL TYPE" => Self::ShellType,
-            "STATISTICS" => Self::Statistics,
-            "STATISTICS DATA" => Self::StatisticsData,
-            "STDSTRINGS" => Self::StdStrings,
-            "SUBSCRIPTION" => Self::Subscription,
-            "SUBSCRIPTION TABLE" => Self::SubscriptionTable,
-            "TABLE" => Self::Table,
-            "TABLE ATTACH" => Self::TableAttach,
-            "TABLE DATA" => Self::TableData,
-            "TABLESPACE" => Self::Tablespace,
-            "TEXT SEARCH CONFIGURATION" => Self::TextSearchConfiguration,
-            "TEXT SEARCH DICTIONARY" => Self::TextSearchDictionary,
-            "TEXT SEARCH PARSER" => Self::TextSearchParser,
-            "TEXT SEARCH TEMPLATE" => Self::TextSearchTemplate,
-            "TRANSFORM" => Self::Transform,
-            "TRIGGER" => Self::Trigger,
-            "TYPE" => Self::Type,
-            "USER" => Self::User,
-            "USER MAPPING" => Self::UserMapping,
-            "VIEW" => Self::View,
-            _ => Self::Other(s),
-        }
+        Self::parse_known(s.as_str()).unwrap_or(Self::Other(s))
     }
 }
 
