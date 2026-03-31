@@ -31,7 +31,7 @@ for row in dump.table_data("public", "users").unwrap() {
 }
 
 // Look up a specific entry
-if let Some(entry) = dump.lookup_entry("TABLE", "public", "users") {
+if let Some(entry) = dump.lookup_entry(&libpgdump::ObjectType::Table, "public", "users") {
     println!("Definition: {}", entry.defn.as_deref().unwrap_or(""));
 }
 ```
@@ -45,7 +45,7 @@ let mut dump = libpgdump::new("mydb", "UTF8", "17.0").unwrap();
 
 // Add a table definition
 let table_id = dump.add_entry(
-    "TABLE",
+    libpgdump::ObjectType::Table,
     Some("public"), Some("users"), Some("postgres"),
     Some("CREATE TABLE public.users (\n    id integer NOT NULL,\n    name text\n);\n"),
     Some("DROP TABLE public.users;\n"),
@@ -54,7 +54,7 @@ let table_id = dump.add_entry(
 
 // Add table data
 let data_id = dump.add_entry(
-    "TABLE DATA",
+    libpgdump::ObjectType::TableData,
     Some("public"), Some("users"), Some("postgres"),
     None, None,
     Some("COPY public.users (id, name) FROM stdin;\n"),
