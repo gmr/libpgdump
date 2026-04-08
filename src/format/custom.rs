@@ -290,6 +290,27 @@ impl<R: Read + Seek> CustomReader<R> {
             buf_pos: 0,
         }))
     }
+
+    /// Read all data blocks eagerly and convert to a full [`Dump`].
+    ///
+    /// This is equivalent to [`Dump::load`](crate::Dump::load) but allows
+    /// inspecting the TOC first before deciding to load everything.
+    pub fn into_dump(mut self) -> Result<crate::dump::Dump> {
+        let (data, blobs) = read_data_blocks(&mut self.reader, &self.header, &self.entries)?;
+
+        let archive = ArchiveData {
+            header: self.header,
+            timestamp: self.timestamp,
+            dbname: self.dbname,
+            server_version: self.server_version,
+            dump_version: self.dump_version,
+            entries: self.entries,
+            data,
+            blobs,
+        };
+
+        Ok(crate::dump::Dump::from_archive_data(archive))
+    }
 }
 
 /// A streaming reader over a single entry's decompressed data.
@@ -1229,6 +1250,67 @@ mod tests {
         entry_reader.read_to_end(&mut streamed).unwrap();
 
         assert_eq!(streamed, data_content);
+    }
+
+    #[test]
+    fn test_custom_reader_into_dump() {
+        use crate::Dump;
+
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let mut archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: true,
+                table_oid: "16384".to_string(),
+                oid: "0".to_string(),
+                tag: Some("users".to_string()),
+                desc: ObjectType::TableData,
+                section: Section::Data,
+                defn: None,
+                drop_stmt: None,
+                copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
+                namespace: Some("public".to_string()),
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: Some("postgres".to_string()),
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NotSet,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.data.insert(1, data_content.to_vec());
+
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+        let archive_bytes = buf.into_inner();
+
+        // Load via Dump (eager) for comparison
+        let mut eager_cursor = Cursor::new(archive_bytes.clone());
+        let eager_archive = read_archive(&mut eager_cursor).unwrap();
+        let eager_dump = Dump::from_archive_data(eager_archive);
+
+        // Load via CustomReader -> into_dump
+        let lazy_cursor = Cursor::new(archive_bytes);
+        let lazy_reader = CustomReader::open(lazy_cursor).unwrap();
+        let lazy_dump = lazy_reader.into_dump().unwrap();
+
+        assert_eq!(lazy_dump.dbname(), eager_dump.dbname());
+        assert_eq!(lazy_dump.server_version(), eager_dump.server_version());
+        assert_eq!(lazy_dump.entries().len(), eager_dump.entries().len());
+        assert_eq!(
+            lazy_dump.entry_data(1).unwrap(),
+            eager_dump.entry_data(1).unwrap()
+        );
     }
 
     #[test]
