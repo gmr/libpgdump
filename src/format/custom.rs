@@ -240,6 +240,129 @@ impl<R: Read + Seek> CustomReader<R> {
             }
         }
     }
+
+    /// Return a streaming reader for an entry's decompressed data.
+    ///
+    /// The returned [`EntryReader`] implements [`Read`] and decompresses data
+    /// one chunk at a time, keeping memory usage proportional to a single
+    /// chunk rather than the entire entry.
+    ///
+    /// Returns `Ok(None)` if the entry has no data. Returns an error for
+    /// `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data) instead,
+    /// because blobs have internal OID framing that doesn't map to a flat byte
+    /// stream.
+    pub fn read_entry_reader(&mut self, dump_id: i32) -> Result<Option<EntryReader<'_, R>>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.dump_id == dump_id)
+            .ok_or(Error::InvalidDumpId(dump_id))?;
+
+        if entry.data_state != OffsetState::Set || !entry.had_dumper {
+            return Ok(None);
+        }
+
+        let offset = entry.offset;
+        self.reader.seek(SeekFrom::Start(offset))?;
+
+        // Read and validate block header
+        let block_type_byte = read_byte(&mut self.reader)?;
+        let block_type = BlockType::from_byte(block_type_byte).ok_or_else(|| {
+            Error::DataIntegrity(format!("unknown block type: {block_type_byte}"))
+        })?;
+        let block_dump_id = read_int(&mut self.reader, self.header.int_size)?;
+        if block_dump_id != dump_id {
+            return Err(Error::DataIntegrity(format!(
+                "block dump_id {block_dump_id} does not match entry dump_id {dump_id}"
+            )));
+        }
+
+        if block_type == BlockType::Blobs {
+            return Err(Error::StreamingNotSupported("BLOBS".to_string()));
+        }
+
+        Ok(Some(EntryReader {
+            reader: &mut self.reader,
+            int_size: self.header.int_size,
+            compression: self.header.compression,
+            done: false,
+            decompressed_buf: Vec::new(),
+            buf_pos: 0,
+        }))
+    }
+}
+
+/// A streaming reader over a single entry's decompressed data.
+///
+/// Reads one compressed chunk at a time from the underlying reader,
+/// decompresses it, and serves bytes from the decompressed buffer.
+/// Memory usage is proportional to one chunk, not the entire entry.
+///
+/// Implements [`Read`] so it can be used with standard I/O adapters
+/// like `BufReader` or `read_to_string`.
+pub struct EntryReader<'a, R: Read + Seek> {
+    reader: &'a mut R,
+    int_size: u8,
+    compression: CompressionAlgorithm,
+    done: bool,
+    decompressed_buf: Vec<u8>,
+    buf_pos: usize,
+}
+
+impl<R: Read + Seek> EntryReader<'_, R> {
+    /// Fill the internal buffer with the next decompressed chunk.
+    /// Returns `true` if data was read, `false` if no more chunks.
+    fn fill_buf(&mut self) -> std::result::Result<bool, std::io::Error> {
+        if self.done {
+            return Ok(false);
+        }
+
+        let chunk_size = read_int(self.reader, self.int_size).map_err(std::io::Error::other)?;
+
+        if chunk_size == 0 {
+            self.done = true;
+            return Ok(false);
+        }
+        if chunk_size < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("negative chunk size: {chunk_size}"),
+            ));
+        }
+
+        let mut chunk = vec![0u8; chunk_size as usize];
+        self.reader.read_exact(&mut chunk)?;
+
+        match self.compression {
+            CompressionAlgorithm::None => {
+                self.decompressed_buf = chunk;
+            }
+            _ => {
+                let cursor = Cursor::new(&chunk);
+                let mut decompressor = compress::decompressor(self.compression, cursor)
+                    .map_err(std::io::Error::other)?;
+                self.decompressed_buf.clear();
+                decompressor.read_to_end(&mut self.decompressed_buf)?;
+            }
+        }
+        self.buf_pos = 0;
+        Ok(true)
+    }
+}
+
+impl<R: Read + Seek> Read for EntryReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // If buffer is exhausted, try to read the next chunk
+        if self.buf_pos >= self.decompressed_buf.len() && !self.fill_buf()? {
+            return Ok(0); // EOF
+        }
+
+        let available = &self.decompressed_buf[self.buf_pos..];
+        let to_copy = available.len().min(buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.buf_pos += to_copy;
+        Ok(to_copy)
+    }
 }
 
 fn read_header<R: Read>(r: &mut R) -> Result<Header> {
@@ -1056,6 +1179,56 @@ mod tests {
 
         let result = reader.read_entry_data(1).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_reader() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let mut archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: true,
+                table_oid: "16384".to_string(),
+                oid: "0".to_string(),
+                tag: Some("users".to_string()),
+                desc: ObjectType::TableData,
+                section: Section::Data,
+                defn: None,
+                drop_stmt: None,
+                copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
+                namespace: Some("public".to_string()),
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: Some("postgres".to_string()),
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NotSet,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.data.insert(1, data_content.to_vec());
+
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = CustomReader::open(buf).unwrap();
+
+        // Stream the data via Read trait
+        let mut entry_reader = reader.read_entry_reader(1).unwrap().unwrap();
+        let mut streamed = Vec::new();
+        entry_reader.read_to_end(&mut streamed).unwrap();
+
+        assert_eq!(streamed, data_content);
     }
 
     #[test]
