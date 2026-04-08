@@ -32,6 +32,15 @@ pub struct Blob {
     pub data: Vec<u8>,
 }
 
+/// The data content of a TOC entry, read on demand from a [`CustomReader`].
+#[derive(Debug)]
+pub enum EntryData {
+    /// Raw (decompressed) bytes for a TABLE DATA entry.
+    Data(Vec<u8>),
+    /// List of large objects for a BLOBS entry.
+    Blobs(Vec<Blob>),
+}
+
 /// Read result containing all parsed archive data.
 #[derive(Debug)]
 pub struct ArchiveData {
@@ -84,6 +93,112 @@ pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
         data,
         blobs,
     })
+}
+
+/// A lazy reader for custom format (`-Fc`) PostgreSQL dump archives.
+///
+/// Parses the header and TOC entries on construction, but defers reading
+/// data blocks until explicitly requested. This allows working with
+/// archives too large to fit in memory.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use libpgdump::format::custom::CustomReader;
+///
+/// let file = File::open("dump.sql").unwrap();
+/// let mut reader = CustomReader::open(BufReader::new(file)).unwrap();
+///
+/// // Inspect TOC without loading data
+/// for entry in reader.entries() {
+///     println!("{}: {:?}", entry.dump_id, entry.desc);
+/// }
+///
+/// // Read a specific entry's data on demand
+/// if let Some(data) = reader.read_entry_data(1).unwrap() {
+///     // process data
+/// }
+/// ```
+pub struct CustomReader<R: Read + Seek> {
+    // reader is used in upcoming read_entry_data / read_entry_reader methods
+    #[allow(dead_code)]
+    reader: R,
+    header: Header,
+    timestamp: Timestamp,
+    dbname: String,
+    server_version: String,
+    dump_version: String,
+    entries: Vec<Entry>,
+}
+
+impl<R: Read + Seek> CustomReader<R> {
+    /// Open a custom format archive, reading only the header and TOC.
+    ///
+    /// No data blocks are read until explicitly requested via
+    /// [`read_entry_data`](Self::read_entry_data) or
+    /// [`read_entry_reader`](Self::read_entry_reader).
+    pub fn open(mut reader: R) -> Result<Self> {
+        let header = read_header(&mut reader)?;
+        let int_size = header.int_size;
+
+        let timestamp = read_timestamp(&mut reader, int_size)?;
+        let dbname = read_string(&mut reader, int_size)?.unwrap_or_default();
+        let server_version = read_string(&mut reader, int_size)?.unwrap_or_default();
+        let dump_version = read_string(&mut reader, int_size)?.unwrap_or_default();
+
+        let toc_count = read_int(&mut reader, int_size)?;
+        if toc_count < 0 {
+            return Err(Error::DataIntegrity(format!(
+                "invalid TOC entry count: {toc_count}"
+            )));
+        }
+        let mut entries = Vec::with_capacity(toc_count as usize);
+        for _ in 0..toc_count {
+            entries.push(read_entry(&mut reader, &header)?);
+        }
+
+        Ok(Self {
+            reader,
+            header,
+            timestamp,
+            dbname,
+            server_version,
+            dump_version,
+            entries,
+        })
+    }
+
+    /// The archive header.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The archive creation timestamp.
+    pub fn timestamp(&self) -> &Timestamp {
+        &self.timestamp
+    }
+
+    /// The database name.
+    pub fn dbname(&self) -> &str {
+        &self.dbname
+    }
+
+    /// The PostgreSQL server version string.
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+
+    /// The pg_dump version string.
+    pub fn dump_version(&self) -> &str {
+        &self.dump_version
+    }
+
+    /// All TOC entries.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
 }
 
 fn read_header<R: Read>(r: &mut R) -> Result<Header> {
@@ -730,6 +845,83 @@ mod tests {
             parsed.entries[0].defn.as_deref(),
             Some("SET client_encoding = 'UTF8';\n")
         );
+    }
+
+    #[test]
+    fn test_custom_reader_open() {
+        // Build an archive with one no-data entry and one data entry
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let mut archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![
+                Entry {
+                    dump_id: 1,
+                    had_dumper: false,
+                    table_oid: "0".to_string(),
+                    oid: "0".to_string(),
+                    tag: Some("ENCODING".to_string()),
+                    desc: ObjectType::Encoding,
+                    section: Section::PreData,
+                    defn: Some("SET client_encoding = 'UTF8';\n".to_string()),
+                    drop_stmt: None,
+                    copy_stmt: None,
+                    namespace: None,
+                    tablespace: None,
+                    tableam: None,
+                    relkind: None,
+                    owner: None,
+                    with_oids: false,
+                    dependencies: vec![],
+                    data_state: OffsetState::NoData,
+                    offset: 0,
+                    filename: None,
+                },
+                Entry {
+                    dump_id: 2,
+                    had_dumper: true,
+                    table_oid: "16384".to_string(),
+                    oid: "0".to_string(),
+                    tag: Some("users".to_string()),
+                    desc: ObjectType::TableData,
+                    section: Section::Data,
+                    defn: None,
+                    drop_stmt: None,
+                    copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
+                    namespace: Some("public".to_string()),
+                    tablespace: None,
+                    tableam: None,
+                    relkind: None,
+                    owner: Some("postgres".to_string()),
+                    with_oids: false,
+                    dependencies: vec![],
+                    data_state: OffsetState::NotSet,
+                    offset: 0,
+                    filename: None,
+                },
+            ],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.data.insert(2, data_content.to_vec());
+
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+
+        // Open with CustomReader — should parse header + TOC only
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        let reader = CustomReader::open(buf).unwrap();
+
+        assert_eq!(reader.dbname(), "testdb");
+        assert_eq!(reader.server_version(), "17.0");
+        assert_eq!(reader.dump_version(), "pg_dump (PostgreSQL) 17.0");
+        assert_eq!(reader.header().version, ArchiveVersion::new(1, 14, 0));
+        assert_eq!(reader.entries().len(), 2);
+        assert_eq!(reader.entries()[0].desc, ObjectType::Encoding);
+        assert_eq!(reader.entries()[1].desc, ObjectType::TableData);
     }
 
     #[test]
