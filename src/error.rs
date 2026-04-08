@@ -34,6 +34,9 @@ pub enum Error {
     #[error("data integrity error: {0}")]
     DataIntegrity(String),
 
+    #[error("streaming not supported for {0} entries; use read_entry_data instead")]
+    StreamingNotSupported(String),
+
     #[error("decompression error: {0}")]
     Decompression(String),
 

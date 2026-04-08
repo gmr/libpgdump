@@ -114,7 +114,7 @@ impl Dump {
         Ok(dump)
     }
 
-    fn from_archive_data(archive: ArchiveData) -> Self {
+    pub(crate) fn from_archive_data(archive: ArchiveData) -> Self {
         let next_dump_id = archive.entries.iter().map(|e| e.dump_id).max().unwrap_or(0) + 1;
         Dump {
             header: archive.header,

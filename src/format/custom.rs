@@ -32,6 +32,15 @@ pub struct Blob {
     pub data: Vec<u8>,
 }
 
+/// The data content of a TOC entry, read on demand from a [`CustomReader`].
+#[derive(Debug)]
+pub enum EntryData {
+    /// Raw (decompressed) bytes for a TABLE DATA entry.
+    Data(Vec<u8>),
+    /// List of large objects for a BLOBS entry.
+    Blobs(Vec<Blob>),
+}
+
 /// Read result containing all parsed archive data.
 #[derive(Debug)]
 pub struct ArchiveData {
@@ -49,11 +58,299 @@ pub struct ArchiveData {
 
 /// Read a custom format archive from a reader.
 pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
+    let (header, timestamp, dbname, server_version, dump_version, entries) = read_toc(r)?;
+
+    // Read data blocks by seeking to each entry's offset
+    let (data, blobs) = read_data_blocks(r, &header, &entries)?;
+
+    Ok(ArchiveData {
+        header,
+        timestamp,
+        dbname,
+        server_version,
+        dump_version,
+        entries,
+        data,
+        blobs,
+    })
+}
+
+/// A lazy reader for custom format (`-Fc`) PostgreSQL dump archives.
+///
+/// Parses the header and TOC entries on construction, but defers reading
+/// data blocks until explicitly requested. This allows working with
+/// archives too large to fit in memory.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use libpgdump::CustomReader;
+///
+/// let file = File::open("dump.sql").unwrap();
+/// let mut reader = CustomReader::open(BufReader::new(file)).unwrap();
+///
+/// // Inspect TOC without loading data
+/// for entry in reader.entries() {
+///     println!("{}: {:?}", entry.dump_id, entry.desc);
+/// }
+///
+/// // Read a specific entry's data on demand
+/// if let Some(data) = reader.read_entry_data(1).unwrap() {
+///     // process data
+/// }
+/// ```
+pub struct CustomReader<R: Read + Seek> {
+    reader: R,
+    header: Header,
+    timestamp: Timestamp,
+    dbname: String,
+    server_version: String,
+    dump_version: String,
+    entries: Vec<Entry>,
+}
+
+impl<R: Read + Seek> CustomReader<R> {
+    /// Open a custom format archive, reading only the header and TOC.
+    ///
+    /// No data blocks are read until explicitly requested via
+    /// [`read_entry_data`](Self::read_entry_data) or
+    /// [`read_entry_reader`](Self::read_entry_reader).
+    pub fn open(mut reader: R) -> Result<Self> {
+        let (header, timestamp, dbname, server_version, dump_version, entries) =
+            read_toc(&mut reader)?;
+
+        Ok(Self {
+            reader,
+            header,
+            timestamp,
+            dbname,
+            server_version,
+            dump_version,
+            entries,
+        })
+    }
+
+    /// The archive header.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The archive creation timestamp.
+    pub fn timestamp(&self) -> &Timestamp {
+        &self.timestamp
+    }
+
+    /// The database name.
+    pub fn dbname(&self) -> &str {
+        &self.dbname
+    }
+
+    /// The PostgreSQL server version string.
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+
+    /// The pg_dump version string.
+    pub fn dump_version(&self) -> &str {
+        &self.dump_version
+    }
+
+    /// All TOC entries.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Read and decompress an entry's data block into memory.
+    ///
+    /// Returns `Ok(None)` if the entry has no data (either `data_state` is not
+    /// `Set` or `had_dumper` is false). Returns an error if `dump_id` is not
+    /// found in the TOC.
+    pub fn read_entry_data(&mut self, dump_id: i32) -> Result<Option<EntryData>> {
+        let block_type = match self.seek_to_data_block(dump_id)? {
+            Some(bt) => bt,
+            None => return Ok(None),
+        };
+
+        match block_type {
+            BlockType::Blobs => {
+                let blobs = read_blob_data(&mut self.reader, &self.header)?;
+                Ok(Some(EntryData::Blobs(blobs)))
+            }
+            BlockType::Data => {
+                let data = read_compressed_data(&mut self.reader, &self.header)?;
+                Ok(Some(EntryData::Data(data)))
+            }
+        }
+    }
+
+    /// Return a streaming reader for an entry's uncompressed data.
+    ///
+    /// The returned [`EntryReader`] implements [`Read`] and streams raw data
+    /// one chunk at a time, keeping memory usage proportional to a single
+    /// chunk rather than the entire entry.
+    ///
+    /// Returns `Ok(None)` if the entry has no data. Returns an error for:
+    /// - `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data)
+    ///   instead, because blobs have internal OID framing that doesn't map
+    ///   to a flat byte stream.
+    /// - Compressed archives — PostgreSQL writes compressed data as slices
+    ///   of a single continuous compressed stream per entry (not independently
+    ///   compressed chunks), so per-chunk streaming decompression would
+    ///   produce corrupt data. Use [`read_entry_data`](Self::read_entry_data)
+    ///   for compressed archives.
+    pub fn read_entry_reader(&mut self, dump_id: i32) -> Result<Option<EntryReader<'_, R>>> {
+        let block_type = match self.seek_to_data_block(dump_id)? {
+            Some(bt) => bt,
+            None => return Ok(None),
+        };
+
+        if block_type == BlockType::Blobs {
+            return Err(Error::StreamingNotSupported("BLOBS".to_string()));
+        }
+        if self.header.compression != CompressionAlgorithm::None {
+            return Err(Error::StreamingNotSupported(
+                "compressed TABLE DATA".to_string(),
+            ));
+        }
+
+        Ok(Some(EntryReader {
+            reader: &mut self.reader,
+            int_size: self.header.int_size,
+            done: false,
+            decompressed_buf: Vec::new(),
+            buf_pos: 0,
+        }))
+    }
+
+    /// Seek to an entry's data block and return the block type.
+    ///
+    /// Returns `Ok(None)` if the entry has no data. Validates the block header
+    /// (type byte and dump_id) after seeking.
+    fn seek_to_data_block(&mut self, dump_id: i32) -> Result<Option<BlockType>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.dump_id == dump_id)
+            .ok_or(Error::InvalidDumpId(dump_id))?;
+
+        if entry.data_state != OffsetState::Set || !entry.had_dumper {
+            return Ok(None);
+        }
+
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+        read_block_header(&mut self.reader, self.header.int_size, dump_id).map(Some)
+    }
+
+    /// Read all data blocks eagerly and convert to a full [`Dump`].
+    ///
+    /// This is equivalent to [`Dump::load`](crate::Dump::load) but allows
+    /// inspecting the TOC first before deciding to load everything.
+    pub fn into_dump(mut self) -> Result<crate::dump::Dump> {
+        let (data, blobs) = read_data_blocks(&mut self.reader, &self.header, &self.entries)?;
+
+        let archive = ArchiveData {
+            header: self.header,
+            timestamp: self.timestamp,
+            dbname: self.dbname,
+            server_version: self.server_version,
+            dump_version: self.dump_version,
+            entries: self.entries,
+            data,
+            blobs,
+        };
+
+        Ok(crate::dump::Dump::from_archive_data(archive))
+    }
+}
+
+/// A streaming reader over a single entry's uncompressed data.
+///
+/// Reads one chunk at a time from the underlying reader, keeping memory
+/// usage proportional to a single chunk rather than the entire entry.
+///
+/// Only supports uncompressed archives. Compressed archives use a single
+/// continuous compressed stream per entry (not independently compressed
+/// chunks), so per-chunk decompression is not possible. Use
+/// [`CustomReader::read_entry_data`] for compressed entries.
+///
+/// Implements [`Read`] so it can be used with standard I/O adapters
+/// like `BufReader` or `read_to_string`.
+pub struct EntryReader<'a, R: Read + Seek> {
+    reader: &'a mut R,
+    int_size: u8,
+    done: bool,
+    decompressed_buf: Vec<u8>,
+    buf_pos: usize,
+}
+
+impl<R: Read + Seek> std::fmt::Debug for EntryReader<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryReader")
+            .field("done", &self.done)
+            .field("buf_pos", &self.buf_pos)
+            .field("buf_len", &self.decompressed_buf.len())
+            .finish()
+    }
+}
+
+impl<R: Read + Seek> EntryReader<'_, R> {
+    /// Fill the internal buffer with the next raw chunk.
+    /// Returns `true` if data was read, `false` if no more chunks.
+    ///
+    /// This only handles uncompressed data. Compressed archives are rejected
+    /// by `read_entry_reader` because PostgreSQL writes compressed data as
+    /// slices of a single continuous compressed stream per entry (not
+    /// independently compressed chunks).
+    fn fill_buf(&mut self) -> std::result::Result<bool, std::io::Error> {
+        if self.done {
+            return Ok(false);
+        }
+
+        let chunk_size = read_int(self.reader, self.int_size).map_err(std::io::Error::other)?;
+
+        if chunk_size == 0 {
+            self.done = true;
+            return Ok(false);
+        }
+        if chunk_size < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("negative chunk size: {chunk_size}"),
+            ));
+        }
+
+        let chunk_len = chunk_size as usize;
+        self.decompressed_buf.clear();
+        self.decompressed_buf.resize(chunk_len, 0);
+        self.reader.read_exact(&mut self.decompressed_buf)?;
+        self.buf_pos = 0;
+        Ok(true)
+    }
+}
+
+impl<R: Read + Seek> Read for EntryReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // If buffer is exhausted, try to read the next chunk
+        if self.buf_pos >= self.decompressed_buf.len() && !self.fill_buf()? {
+            return Ok(0);
+        }
+
+        let available = &self.decompressed_buf[self.buf_pos..];
+        let to_copy = available.len().min(buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.buf_pos += to_copy;
+        Ok(to_copy)
+    }
+}
+
+/// Read the header, timestamp, metadata strings, and all TOC entries.
+/// Shared by `read_archive` (eager) and `CustomReader::open` (lazy).
+#[allow(clippy::type_complexity)]
+fn read_toc<R: Read>(r: &mut R) -> Result<(Header, Timestamp, String, String, String, Vec<Entry>)> {
     let header = read_header(r)?;
     let int_size = header.int_size;
-
-    // For versions < 1.15, compression was encoded as an integer after the header.
-    // The header reading handles this and sets the compression field.
 
     let timestamp = read_timestamp(r, int_size)?;
     let dbname = read_string(r, int_size)?.unwrap_or_default();
@@ -71,19 +368,14 @@ pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
         entries.push(read_entry(r, &header)?);
     }
 
-    // Read data blocks by seeking to each entry's offset
-    let (data, blobs) = read_data_blocks(r, &header, &entries)?;
-
-    Ok(ArchiveData {
+    Ok((
         header,
         timestamp,
         dbname,
         server_version,
         dump_version,
         entries,
-        data,
-        blobs,
-    })
+    ))
 }
 
 fn read_header<R: Read>(r: &mut R) -> Result<Header> {
@@ -283,6 +575,21 @@ fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     })
 }
 
+/// Read and validate a data block header (block type byte + dump_id).
+/// The reader must already be positioned at the start of the block.
+fn read_block_header<R: Read>(r: &mut R, int_size: u8, expected_dump_id: i32) -> Result<BlockType> {
+    let block_type_byte = read_byte(r)?;
+    let block_type = BlockType::from_byte(block_type_byte)
+        .ok_or_else(|| Error::DataIntegrity(format!("unknown block type: {block_type_byte}")))?;
+    let block_dump_id = read_int(r, int_size)?;
+    if block_dump_id != expected_dump_id {
+        return Err(Error::DataIntegrity(format!(
+            "block dump_id {block_dump_id} does not match entry dump_id {expected_dump_id}"
+        )));
+    }
+    Ok(block_type)
+}
+
 /// Read all data blocks from the archive, decompressing them.
 ///
 /// Returns (table_data, blobs) where table_data maps dump_id to decompressed
@@ -302,19 +609,7 @@ fn read_data_blocks<R: Read + Seek>(
         }
 
         r.seek(SeekFrom::Start(entry.offset))?;
-
-        // Read and validate block header
-        let block_type_byte = read_byte(r)?;
-        let block_type = BlockType::from_byte(block_type_byte).ok_or_else(|| {
-            Error::DataIntegrity(format!("unknown block type: {block_type_byte}"))
-        })?;
-        let block_dump_id = read_int(r, header.int_size)?;
-        if block_dump_id != entry.dump_id {
-            return Err(Error::DataIntegrity(format!(
-                "block dump_id {block_dump_id} does not match entry dump_id {}",
-                entry.dump_id
-            )));
-        }
+        let block_type = read_block_header(r, header.int_size, entry.dump_id)?;
 
         match block_type {
             BlockType::Blobs => {
@@ -733,11 +1028,189 @@ mod tests {
     }
 
     #[test]
-    fn test_full_archive_round_trip_with_data() {
+    fn test_custom_reader_open() {
+        // Build an archive with one no-data entry and one data entry
         let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
-
         let mut archive = ArchiveData {
             header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![
+                Entry {
+                    dump_id: 1,
+                    had_dumper: false,
+                    table_oid: "0".to_string(),
+                    oid: "0".to_string(),
+                    tag: Some("ENCODING".to_string()),
+                    desc: ObjectType::Encoding,
+                    section: Section::PreData,
+                    defn: Some("SET client_encoding = 'UTF8';\n".to_string()),
+                    drop_stmt: None,
+                    copy_stmt: None,
+                    namespace: None,
+                    tablespace: None,
+                    tableam: None,
+                    relkind: None,
+                    owner: None,
+                    with_oids: false,
+                    dependencies: vec![],
+                    data_state: OffsetState::NoData,
+                    offset: 0,
+                    filename: None,
+                },
+                Entry {
+                    dump_id: 2,
+                    had_dumper: true,
+                    table_oid: "16384".to_string(),
+                    oid: "0".to_string(),
+                    tag: Some("users".to_string()),
+                    desc: ObjectType::TableData,
+                    section: Section::Data,
+                    defn: None,
+                    drop_stmt: None,
+                    copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
+                    namespace: Some("public".to_string()),
+                    tablespace: None,
+                    tableam: None,
+                    relkind: None,
+                    owner: Some("postgres".to_string()),
+                    with_oids: false,
+                    dependencies: vec![],
+                    data_state: OffsetState::NotSet,
+                    offset: 0,
+                    filename: None,
+                },
+            ],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.data.insert(2, data_content.to_vec());
+
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+
+        // Open with CustomReader — should parse header + TOC only
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        let reader = CustomReader::open(buf).unwrap();
+
+        assert_eq!(reader.dbname(), "testdb");
+        assert_eq!(reader.server_version(), "17.0");
+        assert_eq!(reader.dump_version(), "pg_dump (PostgreSQL) 17.0");
+        assert_eq!(reader.header().version, ArchiveVersion::new(1, 14, 0));
+        assert_eq!(reader.entries().len(), 2);
+        assert_eq!(reader.entries()[0].desc, ObjectType::Encoding);
+        assert_eq!(reader.entries()[1].desc, ObjectType::TableData);
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_data() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header(), data_content);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let result = reader.read_entry_data(1).unwrap();
+        match result {
+            Some(EntryData::Data(bytes)) => assert_eq!(bytes, data_content),
+            other => panic!("expected Some(EntryData::Data), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_reader_no_data_entry() {
+        let archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: false,
+                table_oid: "0".to_string(),
+                oid: "0".to_string(),
+                tag: Some("ENCODING".to_string()),
+                desc: ObjectType::Encoding,
+                section: Section::PreData,
+                defn: Some("SET client_encoding = 'UTF8';\n".to_string()),
+                drop_stmt: None,
+                copy_stmt: None,
+                namespace: None,
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: None,
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NoData,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        let mut reader = CustomReader::open(buf).unwrap();
+
+        let result = reader.read_entry_data(1).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_reader() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header(), data_content);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let mut entry_reader = reader.read_entry_reader(1).unwrap().unwrap();
+        let mut streamed = Vec::new();
+        entry_reader.read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, data_content);
+    }
+
+    #[test]
+    fn test_custom_reader_into_dump() {
+        use crate::Dump;
+
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let archive_bytes = make_data_archive(make_test_header(), data_content);
+
+        // Load via Dump (eager) for comparison
+        let mut eager_cursor = Cursor::new(archive_bytes.clone());
+        let eager_archive = read_archive(&mut eager_cursor).unwrap();
+        let eager_dump = Dump::from_archive_data(eager_archive);
+
+        // Load via CustomReader -> into_dump
+        let lazy_reader = CustomReader::open(Cursor::new(archive_bytes)).unwrap();
+        let lazy_dump = lazy_reader.into_dump().unwrap();
+
+        assert_eq!(lazy_dump.dbname(), eager_dump.dbname());
+        assert_eq!(lazy_dump.server_version(), eager_dump.server_version());
+        assert_eq!(lazy_dump.entries().len(), eager_dump.entries().len());
+        assert_eq!(
+            lazy_dump.entry_data(1).unwrap(),
+            eager_dump.entry_data(1).unwrap()
+        );
+    }
+
+    fn make_test_header_gzip() -> Header {
+        Header {
+            version: ArchiveVersion::new(1, 15, 0),
+            int_size: 4,
+            off_size: 8,
+            format: Format::Custom,
+            compression: CompressionAlgorithm::Gzip,
+        }
+    }
+
+    fn make_data_archive(header: Header, data: &[u8]) -> Vec<u8> {
+        let mut archive = ArchiveData {
+            header,
             timestamp: make_test_timestamp(),
             dbname: "testdb".to_string(),
             server_version: "17.0".to_string(),
@@ -767,13 +1240,142 @@ mod tests {
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.data.insert(1, data_content.to_vec());
-
+        archive.data.insert(1, data.to_vec());
         let mut buf = Cursor::new(Vec::new());
         write_archive(&mut buf, &archive).unwrap();
+        buf.into_inner()
+    }
 
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        let parsed = read_archive(&mut buf).unwrap();
+    fn make_blob_archive() -> Vec<u8> {
+        let mut archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: true,
+                table_oid: "0".to_string(),
+                oid: "0".to_string(),
+                tag: None,
+                desc: ObjectType::Blobs,
+                section: Section::Data,
+                defn: None,
+                drop_stmt: None,
+                copy_stmt: None,
+                namespace: None,
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: None,
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NotSet,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.blobs.insert(
+            1,
+            vec![
+                Blob {
+                    oid: 100,
+                    data: b"blob-content-A".to_vec(),
+                },
+                Blob {
+                    oid: 200,
+                    data: b"blob-content-B".to_vec(),
+                },
+            ],
+        );
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_data_gzip() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header_gzip(), data_content);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let result = reader.read_entry_data(1).unwrap();
+        match result {
+            Some(EntryData::Data(decompressed)) => assert_eq!(decompressed, data_content),
+            other => panic!("expected Some(EntryData::Data), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_reader_compressed_error() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header_gzip(), data_content);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let err = reader.read_entry_reader(1).unwrap_err();
+        assert!(
+            matches!(err, Error::StreamingNotSupported(_)),
+            "expected StreamingNotSupported for compressed entry, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_data_blobs() {
+        let bytes = make_blob_archive();
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let result = reader.read_entry_data(1).unwrap();
+        match result {
+            Some(EntryData::Blobs(blobs)) => {
+                assert_eq!(blobs.len(), 2);
+                assert_eq!(blobs[0].oid, 100);
+                assert_eq!(blobs[0].data, b"blob-content-A");
+                assert_eq!(blobs[1].oid, 200);
+                assert_eq!(blobs[1].data, b"blob-content-B");
+            }
+            other => panic!("expected Some(EntryData::Blobs), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_reader_blobs_error() {
+        let bytes = make_blob_archive();
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let err = reader.read_entry_reader(1).unwrap_err();
+        assert!(
+            matches!(err, Error::StreamingNotSupported(_)),
+            "expected StreamingNotSupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_reader_invalid_dump_id() {
+        let bytes = make_data_archive(make_test_header(), b"data");
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let err = reader.read_entry_data(999).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidDumpId(999)),
+            "expected InvalidDumpId(999), got {err:?}"
+        );
+        let err = reader.read_entry_reader(999).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidDumpId(999)),
+            "expected InvalidDumpId(999), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_full_archive_round_trip_with_data() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header(), data_content);
+
+        let mut cursor = Cursor::new(bytes);
+        let parsed = read_archive(&mut cursor).unwrap();
 
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].data_state, OffsetState::Set);
