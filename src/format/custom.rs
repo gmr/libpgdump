@@ -103,10 +103,10 @@ pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use libpgdump::format::custom::CustomReader;
+/// use libpgdump::CustomReader;
 ///
 /// let file = File::open("dump.sql").unwrap();
 /// let mut reader = CustomReader::open(BufReader::new(file)).unwrap();
@@ -204,30 +204,10 @@ impl<R: Read + Seek> CustomReader<R> {
     /// `Set` or `had_dumper` is false). Returns an error if `dump_id` is not
     /// found in the TOC.
     pub fn read_entry_data(&mut self, dump_id: i32) -> Result<Option<EntryData>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.dump_id == dump_id)
-            .ok_or(Error::InvalidDumpId(dump_id))?;
-
-        if entry.data_state != OffsetState::Set || !entry.had_dumper {
-            return Ok(None);
-        }
-
-        let offset = entry.offset;
-        self.reader.seek(SeekFrom::Start(offset))?;
-
-        // Read and validate block header
-        let block_type_byte = read_byte(&mut self.reader)?;
-        let block_type = BlockType::from_byte(block_type_byte).ok_or_else(|| {
-            Error::DataIntegrity(format!("unknown block type: {block_type_byte}"))
-        })?;
-        let block_dump_id = read_int(&mut self.reader, self.header.int_size)?;
-        if block_dump_id != dump_id {
-            return Err(Error::DataIntegrity(format!(
-                "block dump_id {block_dump_id} does not match entry dump_id {dump_id}"
-            )));
-        }
+        let block_type = match self.seek_to_data_block(dump_id)? {
+            Some(bt) => bt,
+            None => return Ok(None),
+        };
 
         match block_type {
             BlockType::Blobs => {
@@ -252,30 +232,10 @@ impl<R: Read + Seek> CustomReader<R> {
     /// because blobs have internal OID framing that doesn't map to a flat byte
     /// stream.
     pub fn read_entry_reader(&mut self, dump_id: i32) -> Result<Option<EntryReader<'_, R>>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.dump_id == dump_id)
-            .ok_or(Error::InvalidDumpId(dump_id))?;
-
-        if entry.data_state != OffsetState::Set || !entry.had_dumper {
-            return Ok(None);
-        }
-
-        let offset = entry.offset;
-        self.reader.seek(SeekFrom::Start(offset))?;
-
-        // Read and validate block header
-        let block_type_byte = read_byte(&mut self.reader)?;
-        let block_type = BlockType::from_byte(block_type_byte).ok_or_else(|| {
-            Error::DataIntegrity(format!("unknown block type: {block_type_byte}"))
-        })?;
-        let block_dump_id = read_int(&mut self.reader, self.header.int_size)?;
-        if block_dump_id != dump_id {
-            return Err(Error::DataIntegrity(format!(
-                "block dump_id {block_dump_id} does not match entry dump_id {dump_id}"
-            )));
-        }
+        let block_type = match self.seek_to_data_block(dump_id)? {
+            Some(bt) => bt,
+            None => return Ok(None),
+        };
 
         if block_type == BlockType::Blobs {
             return Err(Error::StreamingNotSupported("BLOBS".to_string()));
@@ -289,6 +249,38 @@ impl<R: Read + Seek> CustomReader<R> {
             decompressed_buf: Vec::new(),
             buf_pos: 0,
         }))
+    }
+
+    /// Seek to an entry's data block and return the block type.
+    ///
+    /// Returns `Ok(None)` if the entry has no data. Validates the block header
+    /// (type byte and dump_id) after seeking.
+    fn seek_to_data_block(&mut self, dump_id: i32) -> Result<Option<BlockType>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.dump_id == dump_id)
+            .ok_or(Error::InvalidDumpId(dump_id))?;
+
+        if entry.data_state != OffsetState::Set || !entry.had_dumper {
+            return Ok(None);
+        }
+
+        let offset = entry.offset;
+        self.reader.seek(SeekFrom::Start(offset))?;
+
+        let block_type_byte = read_byte(&mut self.reader)?;
+        let block_type = BlockType::from_byte(block_type_byte).ok_or_else(|| {
+            Error::DataIntegrity(format!("unknown block type: {block_type_byte}"))
+        })?;
+        let block_dump_id = read_int(&mut self.reader, self.header.int_size)?;
+        if block_dump_id != dump_id {
+            return Err(Error::DataIntegrity(format!(
+                "block dump_id {block_dump_id} does not match entry dump_id {dump_id}"
+            )));
+        }
+
+        Ok(Some(block_type))
     }
 
     /// Read all data blocks eagerly and convert to a full [`Dump`].
@@ -330,9 +322,26 @@ pub struct EntryReader<'a, R: Read + Seek> {
     buf_pos: usize,
 }
 
+impl<R: Read + Seek> std::fmt::Debug for EntryReader<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryReader")
+            .field("compression", &self.compression)
+            .field("done", &self.done)
+            .field("buf_pos", &self.buf_pos)
+            .field("buf_len", &self.decompressed_buf.len())
+            .finish()
+    }
+}
+
 impl<R: Read + Seek> EntryReader<'_, R> {
     /// Fill the internal buffer with the next decompressed chunk.
     /// Returns `true` if data was read, `false` if no more chunks.
+    ///
+    /// Each chunk is decompressed independently. This works because pg_dump
+    /// writes compressed data as a single chunk per entry (one compressed
+    /// blob per COPY stream). If a future pg_dump version splits compressed
+    /// data across multiple chunks, this would need to concatenate chunks
+    /// before decompressing (as the eager `read_compressed_data` path does).
     fn fill_buf(&mut self) -> std::result::Result<bool, std::io::Error> {
         if self.done {
             return Ok(false);
@@ -1310,6 +1319,176 @@ mod tests {
         assert_eq!(
             lazy_dump.entry_data(1).unwrap(),
             eager_dump.entry_data(1).unwrap()
+        );
+    }
+
+    fn make_test_header_gzip() -> Header {
+        Header {
+            version: ArchiveVersion::new(1, 15, 0),
+            int_size: 4,
+            off_size: 8,
+            format: Format::Custom,
+            compression: CompressionAlgorithm::Gzip,
+        }
+    }
+
+    fn make_data_archive(header: Header, data: &[u8]) -> Vec<u8> {
+        let mut archive = ArchiveData {
+            header,
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: true,
+                table_oid: "16384".to_string(),
+                oid: "0".to_string(),
+                tag: Some("users".to_string()),
+                desc: ObjectType::TableData,
+                section: Section::Data,
+                defn: None,
+                drop_stmt: None,
+                copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
+                namespace: Some("public".to_string()),
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: Some("postgres".to_string()),
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NotSet,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.data.insert(1, data.to_vec());
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+        buf.into_inner()
+    }
+
+    fn make_blob_archive() -> Vec<u8> {
+        let mut archive = ArchiveData {
+            header: make_test_header(),
+            timestamp: make_test_timestamp(),
+            dbname: "testdb".to_string(),
+            server_version: "17.0".to_string(),
+            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
+            entries: vec![Entry {
+                dump_id: 1,
+                had_dumper: true,
+                table_oid: "0".to_string(),
+                oid: "0".to_string(),
+                tag: None,
+                desc: ObjectType::Blobs,
+                section: Section::Data,
+                defn: None,
+                drop_stmt: None,
+                copy_stmt: None,
+                namespace: None,
+                tablespace: None,
+                tableam: None,
+                relkind: None,
+                owner: None,
+                with_oids: false,
+                dependencies: vec![],
+                data_state: OffsetState::NotSet,
+                offset: 0,
+                filename: None,
+            }],
+            data: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        archive.blobs.insert(
+            1,
+            vec![
+                Blob {
+                    oid: 100,
+                    data: b"blob-content-A".to_vec(),
+                },
+                Blob {
+                    oid: 200,
+                    data: b"blob-content-B".to_vec(),
+                },
+            ],
+        );
+        let mut buf = Cursor::new(Vec::new());
+        write_archive(&mut buf, &archive).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_data_gzip() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header_gzip(), data_content);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let result = reader.read_entry_data(1).unwrap();
+        match result {
+            Some(EntryData::Data(decompressed)) => assert_eq!(decompressed, data_content),
+            other => panic!("expected Some(EntryData::Data), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_reader_gzip() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let bytes = make_data_archive(make_test_header_gzip(), data_content);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let mut entry_reader = reader.read_entry_reader(1).unwrap().unwrap();
+        let mut streamed = Vec::new();
+        entry_reader.read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, data_content);
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_data_blobs() {
+        let bytes = make_blob_archive();
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let result = reader.read_entry_data(1).unwrap();
+        match result {
+            Some(EntryData::Blobs(blobs)) => {
+                assert_eq!(blobs.len(), 2);
+                assert_eq!(blobs[0].oid, 100);
+                assert_eq!(blobs[0].data, b"blob-content-A");
+                assert_eq!(blobs[1].oid, 200);
+                assert_eq!(blobs[1].data, b"blob-content-B");
+            }
+            other => panic!("expected Some(EntryData::Blobs), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_reader_blobs_error() {
+        let bytes = make_blob_archive();
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let err = reader.read_entry_reader(1).unwrap_err();
+        assert!(
+            matches!(err, Error::StreamingNotSupported(_)),
+            "expected StreamingNotSupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_reader_invalid_dump_id() {
+        let bytes = make_data_archive(make_test_header(), b"data");
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let err = reader.read_entry_data(999).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidDumpId(999)),
+            "expected InvalidDumpId(999), got {err:?}"
+        );
+        let err = reader.read_entry_reader(999).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidDumpId(999)),
+            "expected InvalidDumpId(999), got {err:?}"
         );
     }
 
