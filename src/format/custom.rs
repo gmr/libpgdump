@@ -323,28 +323,24 @@ impl<R: Read> Read for CompressedEntryReader<'_, R> {
 /// 
 /// If the entry is compressed, you will need to wrap it with a decompressor.
 ///
-/// Reads one chunk at a time from the underlying reader, keeping memory
-/// usage proportional to a single chunk rather than the entire entry.
-///
 /// Implements [`Read`] so it can be used with standard I/O adapters
 /// like `BufReader` or `read_to_string`.
 ///
-/// Each chunk: length (int), then that many bytes of compressed data.
+/// The data format is a sequence of chunks:
+/// Each chunk: length (int), then that many bytes of raw (either compressed or uncompressed) data.
 /// A length of 0 terminates the sequence.
 pub struct RawEntryReader<'a, R: Read> {
     reader: &'a mut R,
     int_size: u8,
     done: bool,
-    decompressed_buf: Vec<u8>,
-    buf_pos: usize,
+    chunk_remaining: usize,
 }
 
 impl<R: Read> std::fmt::Debug for RawEntryReader<'_, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryReader")
             .field("done", &self.done)
-            .field("buf_pos", &self.buf_pos)
-            .field("buf_len", &self.decompressed_buf.len())
+            .field("chunk_remaining", &self.chunk_remaining)
             .finish()
     }
 }
@@ -355,23 +351,33 @@ impl<R: Read> RawEntryReader<'_, R> {
             reader,
             int_size,
             done: false,
-            decompressed_buf: Vec::new(),
-            buf_pos: 0,
+            chunk_remaining: 0,
         }
     }
 
-    /// Fill the internal buffer with the next raw chunk.
-    /// Returns `true` if data was read, `false` if no more chunks.
-    fn fill_buf(&mut self) -> std::result::Result<bool, std::io::Error> {
+    /// Return the remaining bytes in the current chunk.
+    ///
+    /// If no chunk is currently active, this reads the next chunk header so
+    /// callers can size their output buffer before calling `read`.
+    pub fn remaining_bytes_in_chunk(&mut self) -> std::io::Result<usize> {
+        if self.chunk_remaining == 0 {
+            self.fill_chunk_header()?;
+        }
+        Ok(self.chunk_remaining)
+    }
+
+    /// Read the next chunk size from the archive stream.
+    fn fill_chunk_header(&mut self) -> std::result::Result<(), std::io::Error> {
         if self.done {
-            return Ok(false);
+            return Ok(());
         }
 
         let chunk_size = read_int(self.reader, self.int_size).map_err(std::io::Error::other)?;
 
         if chunk_size == 0 {
             self.done = true;
-            return Ok(false);
+            self.chunk_remaining = 0;
+            return Ok(());
         }
         if chunk_size < 0 {
             return Err(std::io::Error::new(
@@ -380,26 +386,26 @@ impl<R: Read> RawEntryReader<'_, R> {
             ));
         }
 
-        let chunk_len = chunk_size as usize;
-        self.decompressed_buf.clear();
-        self.decompressed_buf.resize(chunk_len, 0);
-        self.reader.read_exact(&mut self.decompressed_buf)?;
-        self.buf_pos = 0;
-        Ok(true)
+        self.chunk_remaining = chunk_size as usize;
+        Ok(())
     }
 }
 
 impl<R: Read> Read for RawEntryReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // If buffer is exhausted, try to read the next chunk
-        if self.buf_pos >= self.decompressed_buf.len() && !self.fill_buf()? {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.chunk_remaining == 0 {
+            self.fill_chunk_header()?;
+        }
+        if self.chunk_remaining == 0 {
             return Ok(0);
         }
 
-        let available = &self.decompressed_buf[self.buf_pos..];
-        let to_copy = available.len().min(buf.len());
-        buf[..to_copy].copy_from_slice(&available[..to_copy]);
-        self.buf_pos += to_copy;
+        let to_copy = self.chunk_remaining.min(buf.len());
+        self.reader.read_exact(&mut buf[..to_copy])?;
+        self.chunk_remaining -= to_copy;
         Ok(to_copy)
     }
 }
@@ -1204,6 +1210,34 @@ mod tests {
         let mut streamed = Vec::new();
         entry_reader.read_to_end(&mut streamed).unwrap();
         assert_eq!(streamed, data_content);
+    }
+
+    #[test]
+    fn test_raw_entry_reader_remaining_bytes_in_chunk() {
+        let data = vec![b'x'; 5000];
+        let bytes = make_data_archive(make_test_header(), &data);
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let mut entry_reader = reader.read_entry_reader(1).unwrap().unwrap();
+
+        match &mut entry_reader {
+            EntryReader::Raw(raw) => {
+                assert_eq!(raw.remaining_bytes_in_chunk().unwrap(), 4096);
+
+                let mut first = vec![0u8; raw.remaining_bytes_in_chunk().unwrap()];
+                raw.read_exact(&mut first).unwrap();
+                assert!(first.iter().all(|b| *b == b'x'));
+
+                assert_eq!(raw.remaining_bytes_in_chunk().unwrap(), 904);
+
+                let mut second = vec![0u8; raw.remaining_bytes_in_chunk().unwrap()];
+                raw.read_exact(&mut second).unwrap();
+                assert!(second.iter().all(|b| *b == b'x'));
+
+                assert_eq!(raw.remaining_bytes_in_chunk().unwrap(), 0);
+            }
+            EntryReader::Compressed(_) => panic!("expected raw entry reader"),
+        }
     }
 
     #[test]
