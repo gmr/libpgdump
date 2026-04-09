@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::compress;
 use crate::constants::MAGIC;
@@ -185,21 +185,19 @@ impl<R: Read + Seek> CustomReader<R> {
         }
     }
 
-    /// Return a streaming reader for an entry's uncompressed data.
+    /// Return a streaming [`EntryReader`] for an entry's data.
     ///
-    /// The returned [`EntryReader`] implements [`Read`] and streams raw data
+    /// The returned reader implements [`Read`] and streams data
     /// one chunk at a time, keeping memory usage proportional to a single
     /// chunk rather than the entire entry.
+    /// 
+    /// If the entry is compressed, the reader will automatically decompress on the fly.
     ///
-    /// Returns `Ok(None)` if the entry has no data. Returns an error for:
-    /// - `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data)
-    ///   instead, because blobs have internal OID framing that doesn't map
-    ///   to a flat byte stream.
-    /// - Compressed archives — PostgreSQL writes compressed data as slices
-    ///   of a single continuous compressed stream per entry (not independently
-    ///   compressed chunks), so per-chunk streaming decompression would
-    ///   produce corrupt data. Use [`read_entry_data`](Self::read_entry_data)
-    ///   for compressed archives.
+    /// Returns `Ok(None)` if the entry has no data.
+    /// 
+    /// Returns an error for `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data)
+    /// instead, because blobs have internal OID framing that doesn't map
+    /// to a flat byte stream.
     pub fn read_entry_reader(&mut self, dump_id: i32) -> Result<Option<EntryReader<'_, R>>> {
         let block_type = match self.seek_to_data_block(dump_id)? {
             Some(bt) => bt,
@@ -209,19 +207,11 @@ impl<R: Read + Seek> CustomReader<R> {
         if block_type == BlockType::Blobs {
             return Err(Error::StreamingNotSupported("BLOBS".to_string()));
         }
-        if self.header.compression != CompressionAlgorithm::None {
-            return Err(Error::StreamingNotSupported(
-                "compressed TABLE DATA".to_string(),
-            ));
-        }
-
-        Ok(Some(EntryReader {
-            reader: &mut self.reader,
-            int_size: self.header.int_size,
-            done: false,
-            decompressed_buf: Vec::new(),
-            buf_pos: 0,
-        }))
+        Ok(Some(EntryReader::new(
+            &mut self.reader,
+            self.header.int_size,
+            self.header.compression,
+        )?))
     }
 
     /// Seek to an entry's data block and return the block type.
@@ -265,19 +255,83 @@ impl<R: Read + Seek> CustomReader<R> {
     }
 }
 
-/// A streaming reader over a single entry's uncompressed data.
+
+/// Either a [`RawEntryReader`] for uncompressed TABLE DATA or a [`CompressedEntryReader`] for compressed data.
+#[derive(Debug)]
+pub enum EntryReader<'a, R: Read> {
+    /// A streaming reader for uncompressed TABLE DATA.
+    Raw(RawEntryReader<'a, R>),
+    /// A streaming reader for compressed data
+    Compressed(CompressedEntryReader<'a, R>),
+}
+
+impl<'a, R: Read> EntryReader<'a, R> {
+    pub fn new(reader: &'a mut R, int_size: u8, compression: CompressionAlgorithm) -> Result<Self> {
+        let raw_reader = RawEntryReader::new(reader, int_size);
+        if compression == CompressionAlgorithm::None {
+            return Ok(EntryReader::Raw(raw_reader));
+        }
+
+        let decompressor = compress::decompressor(compression, raw_reader)?;
+        Ok(EntryReader::Compressed(CompressedEntryReader::new(decompressor)))
+    }
+}
+
+impl<R: Read> Read for EntryReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            EntryReader::Raw(reader) => reader.read(buf),
+            EntryReader::Compressed(reader) => reader.read(buf),
+        }
+    }
+}
+
+/// A streaming reader for an entry's raw (decompressed) data.
+/// 
+/// This typically wraps a RawEntryReader, but any Read will work.
+/// 
+/// The result from read() is the next chunk of uncompressed data.
+pub struct CompressedEntryReader<'a, R: Read> {
+    decompressor: Box<dyn Read + 'a>,
+    _marker: std::marker::PhantomData<R>,
+}
+
+impl<R: Read> std::fmt::Debug for CompressedEntryReader<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedEntryReader").finish()
+    }
+}
+
+impl<'a, R: Read> CompressedEntryReader<'a, R> {
+    fn new(decompressor: Box<dyn Read + 'a>) -> Self {
+        Self {
+            decompressor,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<R: Read> Read for CompressedEntryReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.decompressor.read(buf)
+    }
+}
+
+
+
+/// A streaming reader over a single entry's raw data.
+/// 
+/// If the entry is compressed, you will need to wrap it with a decompressor.
 ///
 /// Reads one chunk at a time from the underlying reader, keeping memory
 /// usage proportional to a single chunk rather than the entire entry.
 ///
-/// Only supports uncompressed archives. Compressed archives use a single
-/// continuous compressed stream per entry (not independently compressed
-/// chunks), so per-chunk decompression is not possible. Use
-/// [`CustomReader::read_entry_data`] for compressed entries.
-///
 /// Implements [`Read`] so it can be used with standard I/O adapters
 /// like `BufReader` or `read_to_string`.
-pub struct EntryReader<'a, R: Read + Seek> {
+///
+/// Each chunk: length (int), then that many bytes of compressed data.
+/// A length of 0 terminates the sequence.
+pub struct RawEntryReader<'a, R: Read> {
     reader: &'a mut R,
     int_size: u8,
     done: bool,
@@ -285,7 +339,7 @@ pub struct EntryReader<'a, R: Read + Seek> {
     buf_pos: usize,
 }
 
-impl<R: Read + Seek> std::fmt::Debug for EntryReader<'_, R> {
+impl<R: Read> std::fmt::Debug for RawEntryReader<'_, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntryReader")
             .field("done", &self.done)
@@ -295,14 +349,19 @@ impl<R: Read + Seek> std::fmt::Debug for EntryReader<'_, R> {
     }
 }
 
-impl<R: Read + Seek> EntryReader<'_, R> {
+impl<R: Read> RawEntryReader<'_, R> {
+    fn new(reader: &mut R, int_size: u8) -> RawEntryReader<'_, R> {
+        RawEntryReader {
+            reader,
+            int_size,
+            done: false,
+            decompressed_buf: Vec::new(),
+            buf_pos: 0,
+        }
+    }
+
     /// Fill the internal buffer with the next raw chunk.
     /// Returns `true` if data was read, `false` if no more chunks.
-    ///
-    /// This only handles uncompressed data. Compressed archives are rejected
-    /// by `read_entry_reader` because PostgreSQL writes compressed data as
-    /// slices of a single continuous compressed stream per entry (not
-    /// independently compressed chunks).
     fn fill_buf(&mut self) -> std::result::Result<bool, std::io::Error> {
         if self.done {
             return Ok(false);
@@ -330,7 +389,7 @@ impl<R: Read + Seek> EntryReader<'_, R> {
     }
 }
 
-impl<R: Read + Seek> Read for EntryReader<'_, R> {
+impl<R: Read> Read for RawEntryReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // If buffer is exhausted, try to read the next chunk
         if self.buf_pos >= self.decompressed_buf.len() && !self.fill_buf()? {
@@ -644,42 +703,16 @@ fn read_blob_data<R: Read>(r: &mut R, header: &Header) -> Result<Vec<Blob>> {
     Ok(blobs)
 }
 
-/// Read and decompress a sequence of data chunks.
+/// Read and (if needed) decompress all of the chunks of an entry
 ///
 /// Each chunk: length (int), then that many bytes of compressed data.
 /// A length of 0 terminates the sequence.
 fn read_compressed_data<R: Read>(r: &mut R, header: &Header) -> Result<Vec<u8>> {
-    let mut compressed_buf = Vec::new();
-
-    loop {
-        let chunk_size = read_int(r, header.int_size)?;
-        if chunk_size == 0 {
-            break;
-        }
-        if chunk_size < 0 {
-            return Err(Error::DataIntegrity(format!(
-                "negative chunk size: {chunk_size}"
-            )));
-        }
-        let mut chunk = vec![0u8; chunk_size as usize];
-        r.read_exact(&mut chunk)?;
-        compressed_buf.extend_from_slice(&chunk);
-    }
-
-    if compressed_buf.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    match header.compression {
-        CompressionAlgorithm::None => Ok(compressed_buf),
-        _ => {
-            let cursor = Cursor::new(&compressed_buf);
-            let mut decompressor = compress::decompressor(header.compression, cursor)?;
-            let mut decompressed = Vec::new();
-            decompressor.read_to_end(&mut decompressed)?;
-            Ok(decompressed)
-        }
-    }
+    let reader = EntryReader::new(r, header.int_size, header.compression)?;
+    let mut decompressed_data = Vec::new();
+    let mut buf_reader = std::io::BufReader::new(reader);
+    buf_reader.read_to_end(&mut decompressed_data)?;
+    Ok(decompressed_data)
 }
 
 /// Write a custom format archive.
@@ -1310,16 +1343,15 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_reader_read_entry_reader_compressed_error() {
+    fn test_custom_reader_read_entry_reader_compressed() {
         let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
         let bytes = make_data_archive(make_test_header_gzip(), data_content);
 
         let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
-        let err = reader.read_entry_reader(1).unwrap_err();
-        assert!(
-            matches!(err, Error::StreamingNotSupported(_)),
-            "expected StreamingNotSupported for compressed entry, got {err:?}"
-        );
+        let mut entry_reader = reader.read_entry_reader(1).unwrap().unwrap();
+        let mut streamed = Vec::new();
+        entry_reader.read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, data_content);
     }
 
     #[test]
