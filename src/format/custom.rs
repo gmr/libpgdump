@@ -1313,9 +1313,9 @@ mod tests {
         buf.into_inner()
     }
 
-    fn make_blob_archive() -> Vec<u8> {
+    fn make_blob_archive(header: Header) -> Vec<u8> {
         let mut archive = ArchiveData {
-            header: make_test_header(),
+            header,
             timestamp: make_test_timestamp(),
             dbname: "testdb".to_string(),
             server_version: "17.0".to_string(),
@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_custom_reader_read_entry_data_blobs() {
-        let bytes = make_blob_archive();
+        let bytes = make_blob_archive(make_test_header());
 
         let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
         let result = reader.read_entry_data(1).unwrap();
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn test_custom_reader_read_entry_reader_blobs_error() {
-        let bytes = make_blob_archive();
+        let bytes = make_blob_archive(make_test_header());
 
         let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
         let err = reader.read_entry_reader(1).unwrap_err();
@@ -1416,6 +1416,24 @@ mod tests {
             matches!(err, Error::StreamingNotSupported(_)),
             "expected StreamingNotSupported, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_custom_reader_read_entry_data_blobs_gzip_multiple_blobs() {
+        let bytes = make_blob_archive(make_test_header_gzip());
+
+        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let result = reader.read_entry_data(1).unwrap();
+        match result {
+            Some(EntryData::Blobs(blobs)) => {
+                assert_eq!(blobs.len(), 2);
+                assert_eq!(blobs[0].oid, 100);
+                assert_eq!(blobs[0].data, b"blob-content-A");
+                assert_eq!(blobs[1].oid, 200);
+                assert_eq!(blobs[1].data, b"blob-content-B");
+            }
+            other => panic!("expected Some(EntryData::Blobs), got {other:?}"),
+        }
     }
 
     #[test]
