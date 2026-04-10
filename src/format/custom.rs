@@ -5,6 +5,7 @@ use crate::compress;
 use crate::constants::MAGIC;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
+use crate::format::ArchiveMetadata;
 use crate::header::Header;
 use crate::io::primitives::{
     read_byte, read_int, read_offset, read_string, write_byte, write_int, write_offset,
@@ -58,18 +59,18 @@ pub struct ArchiveData {
 
 /// Read a custom format archive from a reader.
 pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
-    let (header, timestamp, dbname, server_version, dump_version, entries) = read_toc(r)?;
+    let metadata = read_metadata(r)?;
 
     // Read data blocks by seeking to each entry's offset
-    let (data, blobs) = read_data_blocks(r, &header, &entries)?;
+    let (data, blobs) = read_data_blocks(r, &metadata.header, &metadata.entries)?;
 
     Ok(ArchiveData {
-        header,
-        timestamp,
-        dbname,
-        server_version,
-        dump_version,
-        entries,
+        header: metadata.header,
+        timestamp: metadata.timestamp,
+        dbname: metadata.dbname,
+        server_version: metadata.server_version,
+        dump_version: metadata.dump_version,
+        entries: metadata.entries,
         data,
         blobs,
     })
@@ -118,17 +119,16 @@ impl<R: Read + Seek> CustomReader<R> {
     /// [`read_entry_data`](Self::read_entry_data) or
     /// [`read_entry_reader`](Self::read_entry_reader).
     pub fn open(mut reader: R) -> Result<Self> {
-        let (header, timestamp, dbname, server_version, dump_version, entries) =
-            read_toc(&mut reader)?;
+        let metadata = read_metadata(&mut reader)?;
 
         Ok(Self {
             reader,
-            header,
-            timestamp,
-            dbname,
-            server_version,
-            dump_version,
-            entries,
+            header: metadata.header,
+            timestamp: metadata.timestamp,
+            dbname: metadata.dbname,
+            server_version: metadata.server_version,
+            dump_version: metadata.dump_version,
+            entries: metadata.entries,
         })
     }
 
@@ -347,8 +347,7 @@ impl<R: Read + Seek> Read for EntryReader<'_, R> {
 
 /// Read the header, timestamp, metadata strings, and all TOC entries.
 /// Shared by `read_archive` (eager) and `CustomReader::open` (lazy).
-#[allow(clippy::type_complexity)]
-fn read_toc<R: Read>(r: &mut R) -> Result<(Header, Timestamp, String, String, String, Vec<Entry>)> {
+pub fn read_metadata<R: Read>(r: &mut R) -> Result<ArchiveMetadata> {
     let header = read_header(r)?;
     let int_size = header.int_size;
 
@@ -368,14 +367,14 @@ fn read_toc<R: Read>(r: &mut R) -> Result<(Header, Timestamp, String, String, St
         entries.push(read_entry(r, &header)?);
     }
 
-    Ok((
+    Ok(ArchiveMetadata {
         header,
         timestamp,
         dbname,
         server_version,
         dump_version,
         entries,
-    ))
+    })
 }
 
 fn read_header<R: Read>(r: &mut R) -> Result<Header> {
