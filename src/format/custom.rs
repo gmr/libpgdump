@@ -190,11 +190,11 @@ impl<R: Read + Seek> CustomReader<R> {
     /// The returned reader implements [`Read`] and streams data
     /// one chunk at a time, keeping memory usage proportional to a single
     /// chunk rather than the entire entry.
-    /// 
+    ///
     /// If the entry is compressed, the reader will automatically decompress on the fly.
     ///
     /// Returns `Ok(None)` if the entry has no data.
-    /// 
+    ///
     /// Returns an error for `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data)
     /// instead, because blobs have internal OID framing that doesn't map
     /// to a flat byte stream.
@@ -255,7 +255,6 @@ impl<R: Read + Seek> CustomReader<R> {
     }
 }
 
-
 /// Either a [`RawEntryReader`] for uncompressed TABLE DATA or a [`CompressedEntryReader`] for compressed data.
 #[derive(Debug)]
 pub enum EntryReader<'a, R: Read> {
@@ -273,7 +272,9 @@ impl<'a, R: Read> EntryReader<'a, R> {
         }
 
         let decompressor = compress::decompressor(compression, raw_reader)?;
-        Ok(EntryReader::Compressed(CompressedEntryReader::new(decompressor)))
+        Ok(EntryReader::Compressed(CompressedEntryReader::new(
+            decompressor,
+        )))
     }
 }
 
@@ -287,9 +288,9 @@ impl<R: Read> Read for EntryReader<'_, R> {
 }
 
 /// A streaming reader for an entry's raw (decompressed) data.
-/// 
+///
 /// This typically wraps a RawEntryReader, but any Read will work.
-/// 
+///
 /// The result from read() is the next chunk of uncompressed data.
 pub struct CompressedEntryReader<'a, R: Read> {
     decompressor: Box<dyn Read + 'a>,
@@ -317,10 +318,8 @@ impl<R: Read> Read for CompressedEntryReader<'_, R> {
     }
 }
 
-
-
 /// A streaming reader over a single entry's raw data.
-/// 
+///
 /// If the entry is compressed, you will need to wrap it with a decompressor.
 ///
 /// Implements [`Read`] so it can be used with standard I/O adapters
