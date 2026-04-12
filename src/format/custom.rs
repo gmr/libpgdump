@@ -7,30 +7,13 @@ use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::header::Header;
 use crate::io::primitives::{
-    read_byte, read_int, read_offset, read_string, write_byte, write_int, write_offset,
-    write_string,
+    read_byte, read_int, read_offset, read_string, read_timestamp, write_byte, write_int,
+    write_offset, write_string, write_timestamp,
 };
 use crate::types::{BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 
-/// Timestamp fields from the archive header.
-#[derive(Debug, Clone)]
-pub struct Timestamp {
-    pub second: i32,
-    pub minute: i32,
-    pub hour: i32,
-    pub day: i32,
-    pub month: i32,
-    pub year: i32,
-    pub is_dst: i32,
-}
-
-/// A single large object (blob) with its OID and decompressed content.
-#[derive(Debug, Clone)]
-pub struct Blob {
-    pub oid: i32,
-    pub data: Vec<u8>,
-}
+pub use crate::types::{ArchiveData, Blob, Timestamp};
 
 /// The data content of a TOC entry, read on demand from a [`CustomReader`].
 #[derive(Debug)]
@@ -39,21 +22,6 @@ pub enum EntryData {
     Data(Vec<u8>),
     /// List of large objects for a BLOBS entry.
     Blobs(Vec<Blob>),
-}
-
-/// Read result containing all parsed archive data.
-#[derive(Debug)]
-pub struct ArchiveData {
-    pub header: Header,
-    pub timestamp: Timestamp,
-    pub dbname: String,
-    pub server_version: String,
-    pub dump_version: String,
-    pub entries: Vec<Entry>,
-    /// Map of dump_id -> raw (decompressed) data bytes for TABLE DATA entries.
-    pub data: HashMap<i32, Vec<u8>>,
-    /// Map of dump_id -> list of blobs for BLOBS entries.
-    pub blobs: HashMap<i32, Vec<Blob>>,
 }
 
 /// Read a custom format archive from a reader.
@@ -451,18 +419,6 @@ fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     })
 }
 
-fn read_timestamp<R: Read>(r: &mut R, int_size: u8) -> Result<Timestamp> {
-    Ok(Timestamp {
-        second: read_int(r, int_size)?,
-        minute: read_int(r, int_size)?,
-        hour: read_int(r, int_size)?,
-        day: read_int(r, int_size)?,
-        month: read_int(r, int_size)?,
-        year: read_int(r, int_size)?,
-        is_dst: read_int(r, int_size)?,
-    })
-}
-
 fn read_entry<R: Read>(r: &mut R, header: &Header) -> Result<Entry> {
     let int_size = header.int_size;
     let off_size = header.off_size;
@@ -762,17 +718,6 @@ fn write_header<W: std::io::Write>(w: &mut W, header: &Header) -> Result<()> {
     Ok(())
 }
 
-fn write_timestamp<W: std::io::Write>(w: &mut W, ts: &Timestamp, int_size: u8) -> Result<()> {
-    write_int(w, ts.second, int_size)?;
-    write_int(w, ts.minute, int_size)?;
-    write_int(w, ts.hour, int_size)?;
-    write_int(w, ts.day, int_size)?;
-    write_int(w, ts.month, int_size)?;
-    write_int(w, ts.year, int_size)?;
-    write_int(w, ts.is_dst, int_size)?;
-    Ok(())
-}
-
 /// Write an entry, returning the file position of the offset field (for later fixup).
 fn write_entry<W: std::io::Write + Seek>(w: &mut W, entry: &Entry, header: &Header) -> Result<u64> {
     let int_size = header.int_size;
@@ -961,23 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamp_round_trip() {
-        let ts = make_test_timestamp();
-        let mut buf = Vec::new();
-        write_timestamp(&mut buf, &ts, 4).unwrap();
-
-        let mut cursor = Cursor::new(&buf);
-        let parsed = read_timestamp(&mut cursor, 4).unwrap();
-        assert_eq!(parsed.second, ts.second);
-        assert_eq!(parsed.minute, ts.minute);
-        assert_eq!(parsed.hour, ts.hour);
-        assert_eq!(parsed.day, ts.day);
-        assert_eq!(parsed.month, ts.month);
-        assert_eq!(parsed.year, ts.year);
-        assert_eq!(parsed.is_dst, ts.is_dst);
-    }
-
-    #[test]
     fn test_full_archive_round_trip_no_data() {
         let archive = ArchiveData {
             header: make_test_header(),
@@ -1019,6 +947,7 @@ mod tests {
 
         assert_eq!(parsed.dbname, "testdb");
         assert_eq!(parsed.server_version, "17.0");
+        assert_eq!(parsed.dump_version, "pg_dump (PostgreSQL) 17.0");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].desc, ObjectType::Encoding);
         assert_eq!(
@@ -1095,6 +1024,7 @@ mod tests {
         buf.seek(SeekFrom::Start(0)).unwrap();
         let reader = CustomReader::open(buf).unwrap();
 
+        assert_eq!(reader.timestamp(), &make_test_timestamp());
         assert_eq!(reader.dbname(), "testdb");
         assert_eq!(reader.server_version(), "17.0");
         assert_eq!(reader.dump_version(), "pg_dump (PostgreSQL) 17.0");

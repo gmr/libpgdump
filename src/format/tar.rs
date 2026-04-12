@@ -2,10 +2,9 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::format::custom::ArchiveData;
 use crate::format::directory;
 use crate::header::Header;
-use crate::types::{CompressionAlgorithm, Format};
+use crate::types::{ArchiveData, CompressionAlgorithm, Format};
 
 const TAR_BLOCK_SIZE: usize = 512;
 
@@ -252,29 +251,13 @@ fn write_octal(buf: &mut [u8], value: usize, width: usize) -> Result<()> {
     Ok(())
 }
 
-impl Clone for ArchiveData {
-    fn clone(&self) -> Self {
-        ArchiveData {
-            header: self.header.clone(),
-            timestamp: self.timestamp.clone(),
-            dbname: self.dbname.clone(),
-            server_version: self.server_version.clone(),
-            dump_version: self.dump_version.clone(),
-            entries: self.entries.clone(),
-            data: self.data.clone(),
-            blobs: self.blobs.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
     use crate::entry::Entry;
-    use crate::format::custom::{Blob, Timestamp};
-    use crate::types::{ObjectType, OffsetState, Section};
+    use crate::types::{Blob, ObjectType, OffsetState, Section, Timestamp};
     use crate::version::ArchiveVersion;
 
     fn make_test_header() -> Header {

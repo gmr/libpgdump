@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
-use crate::types::OffsetState;
+use crate::types::{OffsetState, Timestamp};
 
 /// Read a single byte.
 pub fn read_byte<R: Read>(r: &mut R) -> Result<u8> {
@@ -103,6 +103,31 @@ pub fn write_offset<W: Write>(
     for i in 0..off_size {
         write_byte(w, ((offset >> (i * 8)) & 0xFF) as u8)?;
     }
+    Ok(())
+}
+
+/// Read a pg_dump timestamp (7 consecutive integers).
+pub fn read_timestamp<R: Read>(r: &mut R, int_size: u8) -> Result<Timestamp> {
+    Ok(Timestamp {
+        second: read_int(r, int_size)?,
+        minute: read_int(r, int_size)?,
+        hour: read_int(r, int_size)?,
+        day: read_int(r, int_size)?,
+        month: read_int(r, int_size)?,
+        year: read_int(r, int_size)?,
+        is_dst: read_int(r, int_size)?,
+    })
+}
+
+/// Write a pg_dump timestamp (7 consecutive integers).
+pub fn write_timestamp<W: Write>(w: &mut W, ts: &Timestamp, int_size: u8) -> Result<()> {
+    write_int(w, ts.second, int_size)?;
+    write_int(w, ts.minute, int_size)?;
+    write_int(w, ts.hour, int_size)?;
+    write_int(w, ts.day, int_size)?;
+    write_int(w, ts.month, int_size)?;
+    write_int(w, ts.year, int_size)?;
+    write_int(w, ts.is_dst, int_size)?;
     Ok(())
 }
 
@@ -219,6 +244,26 @@ mod tests {
         let (state, offset) = read_offset(&mut Cursor::new(&buf), 8).unwrap();
         assert_eq!(state, OffsetState::Set);
         assert_eq!(offset, big_offset);
+    }
+
+    #[test]
+    fn test_read_write_timestamp() {
+        let ts = Timestamp {
+            second: 30,
+            minute: 15,
+            hour: 10,
+            day: 25,
+            month: 3,
+            year: 2025,
+            is_dst: 0,
+        };
+
+        let mut buf = Vec::new();
+        write_timestamp(&mut buf, &ts, 4).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let parsed = read_timestamp(&mut cursor, 4).unwrap();
+        assert_eq!(parsed, ts);
     }
 
     #[test]
