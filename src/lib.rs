@@ -15,9 +15,12 @@ use std::path::Path;
 pub use dump::Dump;
 pub use entry::Entry;
 pub use error::{Error, Result};
-pub use format::custom::{Blob, CustomReader, EntryData, EntryReader};
+pub use format::custom::{CustomReader, EntryData, EntryReader};
 pub use header::Header;
-pub use types::{BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
+pub use types::{
+    ArchiveData, Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
+    Timestamp,
+};
 pub use version::ArchiveVersion;
 
 /// Load a PostgreSQL custom format dump file.

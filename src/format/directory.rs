@@ -7,12 +7,14 @@ use crate::compress;
 use crate::constants::MAGIC;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-use crate::format::custom::{ArchiveData, Blob, Timestamp};
 use crate::header::Header;
 use crate::io::primitives::{
-    read_byte, read_int, read_string, write_byte, write_int, write_string,
+    read_byte, read_int, read_string, read_timestamp, write_byte, write_int, write_string,
+    write_timestamp,
 };
-use crate::types::{CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
+use crate::types::{
+    ArchiveData, Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
+};
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 use flate2::read::GzDecoder;
 
@@ -227,29 +229,6 @@ fn write_header<W: Write>(w: &mut W, header: &Header) -> Result<()> {
         write_int(w, level, header.int_size)?;
     }
 
-    Ok(())
-}
-
-fn read_timestamp<R: Read>(r: &mut R, int_size: u8) -> Result<Timestamp> {
-    Ok(Timestamp {
-        second: read_int(r, int_size)?,
-        minute: read_int(r, int_size)?,
-        hour: read_int(r, int_size)?,
-        day: read_int(r, int_size)?,
-        month: read_int(r, int_size)?,
-        year: read_int(r, int_size)?,
-        is_dst: read_int(r, int_size)?,
-    })
-}
-
-fn write_timestamp<W: Write>(w: &mut W, ts: &Timestamp, int_size: u8) -> Result<()> {
-    write_int(w, ts.second, int_size)?;
-    write_int(w, ts.minute, int_size)?;
-    write_int(w, ts.hour, int_size)?;
-    write_int(w, ts.day, int_size)?;
-    write_int(w, ts.month, int_size)?;
-    write_int(w, ts.year, int_size)?;
-    write_int(w, ts.is_dst, int_size)?;
     Ok(())
 }
 
@@ -621,6 +600,7 @@ fn write_blob_files(dir: &Path, header: &Header, dump_id: i32, blobs: &[Blob]) -
 mod tests {
     use super::*;
     use crate::types::OffsetState;
+    use crate::types::Timestamp;
 
     fn make_test_header() -> Header {
         Header {
