@@ -1,3 +1,42 @@
+use std::collections::HashMap;
+
+use crate::entry::Entry;
+use crate::header::Header;
+
+/// Timestamp fields from the archive header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timestamp {
+    pub second: i32,
+    pub minute: i32,
+    pub hour: i32,
+    pub day: i32,
+    pub month: i32,
+    pub year: i32,
+    pub is_dst: i32,
+}
+
+/// A single large object (blob) with its OID and decompressed content.
+#[derive(Debug, Clone)]
+pub struct Blob {
+    pub oid: i32,
+    pub data: Vec<u8>,
+}
+
+/// Read result containing all parsed archive data.
+#[derive(Debug, Clone)]
+pub struct ArchiveData {
+    pub header: Header,
+    pub timestamp: Timestamp,
+    pub dbname: String,
+    pub server_version: String,
+    pub dump_version: String,
+    pub entries: Vec<Entry>,
+    /// Map of dump_id -> raw (decompressed) data bytes for TABLE DATA entries.
+    pub data: HashMap<i32, Vec<u8>>,
+    /// Map of dump_id -> list of blobs for BLOBS entries.
+    pub blobs: HashMap<i32, Vec<Blob>>,
+}
+
 /// PostgreSQL dump object type.
 ///
 /// Each variant corresponds to an object type string as stored in the TOC
