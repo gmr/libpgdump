@@ -54,8 +54,10 @@ pub fn read_dump<R: Read + Seek>(r: &mut R) -> Result<Dump> {
 /// }
 ///
 /// // Read a specific entry's data on demand
-/// if let Some(entry_reader) = loader.open_data_reader(1).unwrap() {
-///     // process data
+/// if let Some(reader) = loader.open_data_reader(1).unwrap() {
+///     let mut data = Vec::new();
+///     reader.read_to_end(&mut data).unwrap();
+///     println!("Entry 1 data: {} bytes", data.len());
 /// }
 /// ```
 pub struct CustomDataLoader<R: Read + Seek> {
