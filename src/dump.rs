@@ -17,8 +17,8 @@ use crate::version::{self, ArchiveVersion};
 #[derive(Debug, Clone)]
 pub struct Dump {
     pub toc: TableOfContents,
-    pub(crate) data: HashMap<i32, Vec<u8>>,
-    pub(crate) blobs: HashMap<i32, Vec<Blob>>,
+    pub data: HashMap<i32, Vec<u8>>,
+    pub blobs: HashMap<i32, Vec<Blob>>,
 }
 
 impl Dump {
