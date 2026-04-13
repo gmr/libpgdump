@@ -4,10 +4,9 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-pub use crate::format::custom_entry_data::{EntryReader};
+pub use crate::format::custom_entry_data::EntryReader;
 use crate::format::custom_entry_data::{
-    read_blob_data, read_block_header, read_compressed_data, write_blob_block,
-    write_data_block,
+    read_blob_data, read_block_header, read_compressed_data, write_blob_block, write_data_block,
 };
 use crate::format::custom_toc::{read_toc, write_toc};
 use crate::toc::TableOfContents;
@@ -342,9 +341,7 @@ mod tests {
         assert_eq!(parsed.toc, dump.toc);
         assert_eq!(parsed.data.len(), 0);
         assert_eq!(parsed.blobs.len(), 0);
-        assert_eq!(
-            parsed.toc.entries[0], dump.toc.entries[0]
-        );
+        assert_eq!(parsed.toc.entries[0], dump.toc.entries[0]);
     }
 
     #[test]

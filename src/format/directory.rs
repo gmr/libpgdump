@@ -12,9 +12,7 @@ use crate::io::primitives::{
     write_timestamp,
 };
 use crate::toc::TableOfContents;
-use crate::types::{
-    Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
-};
+use crate::types::{Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 use flate2::read::GzDecoder;
 
@@ -154,18 +152,17 @@ fn read_toc<R: Read>(r: &mut R) -> Result<TableOfContents> {
     };
 
     let timestamp = read_timestamp(r, int_size)?;
-    let dbname = read_string( r, int_size)?.unwrap_or_default();
-    let server_version = read_string( r, int_size)?.unwrap_or_default();
-    let dump_version = read_string( r, int_size)?.unwrap_or_default();
+    let dbname = read_string(r, int_size)?.unwrap_or_default();
+    let server_version = read_string(r, int_size)?.unwrap_or_default();
+    let dump_version = read_string(r, int_size)?.unwrap_or_default();
 
-    let toc_count = read_int( r, int_size)?;
+    let toc_count = read_int(r, int_size)?;
     if toc_count < 0 {
         return Err(Error::DataIntegrity(format!(
             "invalid TOC entry count: {toc_count}"
         )));
     }
 
-    
     let mut toc = TableOfContents {
         version,
         int_size,
@@ -176,7 +173,7 @@ fn read_toc<R: Read>(r: &mut R) -> Result<TableOfContents> {
         dbname,
         server_version,
         dump_version,
-        entries: Vec::with_capacity(toc_count as usize)
+        entries: Vec::with_capacity(toc_count as usize),
     };
     for _ in 0..toc_count {
         toc.entries.push(read_toc_entry(r, &toc)?);
@@ -209,7 +206,7 @@ fn write_toc<W: Write>(w: &mut W, toc: &TableOfContents) -> Result<()> {
         };
         write_int(w, level, toc.int_size)?;
     }
-    
+
     write_timestamp(w, &toc.timestamp, toc.int_size)?;
     write_string(w, Some(&toc.dbname), toc.int_size)?;
     write_string(w, Some(&toc.server_version), toc.int_size)?;
