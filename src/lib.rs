@@ -11,8 +11,6 @@ pub mod version;
 
 use std::path::Path;
 
-pub use io::entry_data::{CompressedEntryReader, EntryReader, RawEntryReader};
-
 pub use dump::Dump;
 pub use entry::Entry;
 pub use error::{Error, Result};

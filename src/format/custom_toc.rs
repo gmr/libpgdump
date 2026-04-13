@@ -10,7 +10,7 @@ use crate::{
     version::{ArchiveVersion, MAX_VERSION, MIN_VERSION},
 };
 
-pub const MAGIC: &[u8; 5] = b"PGDMP";
+const MAGIC: &[u8; 5] = b"PGDMP";
 
 /// Read the header, timestamp, metadata strings, and all TOC entries.
 /// Shared by `read_dump` (eager) and `CustomReader::open` (lazy).

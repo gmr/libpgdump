@@ -4,15 +4,16 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-use crate::io::entry_data::{
-    EntryReader, read_blob_data, read_block_header, read_compressed_data, write_blob_block,
+pub use crate::format::custom_entry_data::{EntryReader};
+use crate::format::custom_entry_data::{
+    read_blob_data, read_block_header, read_compressed_data, write_blob_block,
     write_data_block,
 };
-use crate::io::toc::{read_toc, write_toc};
+use crate::format::custom_toc::{read_toc, write_toc};
 use crate::toc::TableOfContents;
 use crate::types::{BlockType, OffsetState};
 
-pub use crate::types::{Blob, Timestamp};
+use crate::types::{Blob, Timestamp};
 
 /// The data content of a TOC entry, read on demand from a [`CustomReader`].
 #[derive(Debug)]

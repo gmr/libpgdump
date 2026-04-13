@@ -4,7 +4,6 @@ use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::compress;
-use crate::io::toc::MAGIC;
 use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
@@ -18,6 +17,8 @@ use crate::types::{
 };
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 use flate2::read::GzDecoder;
+
+const MAGIC: &[u8; 5] = b"PGDMP";
 
 /// Read a directory format dump from the given path.
 pub fn read_dump(dir: &Path) -> Result<Dump> {
