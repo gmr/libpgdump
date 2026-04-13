@@ -12,7 +12,7 @@ use crate::format::custom_toc::{read_toc, write_toc};
 use crate::toc::TableOfContents;
 use crate::types::{BlockType, OffsetState};
 
-use crate::types::{Blob, Timestamp};
+use crate::types::{Blob};
 
 /// The data content of a TOC entry, read on demand from a [`CustomReader`].
 #[derive(Debug)]
@@ -44,13 +44,13 @@ pub fn read_dump<R: Read + Seek>(r: &mut R) -> Result<Dump> {
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use libpgdump::CustomReader;
+/// use libpgdump::CustomDataReader;
 ///
 /// let file = File::open("dump.sql").unwrap();
-/// let mut reader = CustomReader::open(BufReader::new(file)).unwrap();
+/// let mut reader = CustomDataReader::from_reader(BufReader::new(file)).unwrap();
 ///
 /// // Inspect TOC without loading data
-/// for entry in reader.entries() {
+/// for entry in &reader.toc.entries {
 ///     println!("{}: {:?}", entry.dump_id, entry.desc);
 /// }
 ///
@@ -59,51 +59,22 @@ pub fn read_dump<R: Read + Seek>(r: &mut R) -> Result<Dump> {
 ///     // process data
 /// }
 /// ```
-pub struct CustomReader<R: Read + Seek> {
+pub struct CustomDataReader<R: Read + Seek> {
     reader: R,
-    toc: TableOfContents,
+    pub toc: TableOfContents,
 }
 
-impl<R: Read + Seek> CustomReader<R> {
+impl<R: Read + Seek> CustomDataReader<R> {
     /// Open a custom format archive, reading only the header and TOC.
     ///
     /// No data blocks are read until explicitly requested via
     /// [`read_entry_data`](Self::read_entry_data) or
     /// [`read_entry_reader`](Self::read_entry_reader).
-    pub fn open(mut reader: R) -> Result<Self> {
+    pub fn from_reader(mut reader: R) -> Result<Self> {
         let toc = read_toc(&mut reader)?;
         Ok(Self { reader, toc })
     }
 
-    /// The archive header.
-    pub fn header(&self) -> &TableOfContents {
-        &self.toc
-    }
-
-    /// The archive creation timestamp.
-    pub fn timestamp(&self) -> &Timestamp {
-        &self.toc.timestamp
-    }
-
-    /// The database name.
-    pub fn dbname(&self) -> &str {
-        &self.toc.dbname
-    }
-
-    /// The PostgreSQL server version string.
-    pub fn server_version(&self) -> &str {
-        &self.toc.server_version
-    }
-
-    /// The pg_dump version string.
-    pub fn dump_version(&self) -> &str {
-        &self.toc.dump_version
-    }
-
-    /// All TOC entries.
-    pub fn entries(&self) -> &[Entry] {
-        &self.toc.entries
-    }
 
     /// Read and decompress an entry's data block into memory.
     ///
@@ -268,7 +239,7 @@ pub fn write_dump<W: std::io::Write>(w: &mut W, dump: &Dump) -> Result<usize> {
 mod tests {
     use std::io::Cursor;
 
-    use crate::{ArchiveVersion, CompressionAlgorithm, Format, ObjectType, Section};
+    use crate::{ArchiveVersion, CompressionAlgorithm, Format, ObjectType, Section, Timestamp};
 
     use super::*;
 
@@ -411,17 +382,17 @@ mod tests {
 
         // Open with CustomReader — should parse header + TOC only
         let buf_cursor = Cursor::new(buf);
-        let reader = CustomReader::open(buf_cursor).unwrap();
+        let reader = CustomDataReader::from_reader(buf_cursor).unwrap();
 
         // can't compare entire TOC due to offset differences, but can check key fields and entries
-        assert_eq!(reader.timestamp(), &make_test_timestamp());
-        assert_eq!(reader.dbname(), "testdb");
-        assert_eq!(reader.server_version(), "17.0");
-        assert_eq!(reader.dump_version(), "pg_dump (PostgreSQL) 17.0");
-        assert_eq!(reader.header().version, ArchiveVersion::new(1, 14, 0));
-        assert_eq!(reader.entries().len(), 2);
-        assert_eq!(reader.entries()[0].desc, ObjectType::Encoding);
-        assert_eq!(reader.entries()[1].desc, ObjectType::TableData);
+        assert_eq!(reader.toc.timestamp, make_test_timestamp());
+        assert_eq!(reader.toc.dbname, "testdb");
+        assert_eq!(reader.toc.server_version, "17.0");
+        assert_eq!(reader.toc.dump_version, "pg_dump (PostgreSQL) 17.0");
+        assert_eq!(reader.toc.version, ArchiveVersion::new(1, 14, 0));
+        assert_eq!(reader.toc.entries.len(), 2);
+        assert_eq!(reader.toc.entries[0].desc, ObjectType::Encoding);
+        assert_eq!(reader.toc.entries[1].desc, ObjectType::TableData);
     }
 
     #[test]
@@ -460,7 +431,7 @@ mod tests {
         write_dump(&mut buf, &dump).unwrap();
 
         buf.seek(SeekFrom::Start(0)).unwrap();
-        let mut reader = CustomReader::open(buf).unwrap();
+        let mut reader = CustomDataReader::from_reader(buf).unwrap();
 
         let result = reader.read_entry_data(1).unwrap();
         assert!(result.is_none());
@@ -476,7 +447,7 @@ mod tests {
         let eager_dump = read_dump(&mut eager_cursor).unwrap();
 
         // Load via CustomReader -> into_dump
-        let lazy_reader = CustomReader::open(Cursor::new(archive_bytes)).unwrap();
+        let lazy_reader = CustomDataReader::from_reader(Cursor::new(archive_bytes)).unwrap();
         let lazy_dump = lazy_reader.into_dump().unwrap();
 
         assert!(lazy_dump.get_entry(1).is_some());
@@ -576,7 +547,7 @@ mod tests {
     fn test_custom_reader_read_entry_reader_blobs_error() {
         let bytes = make_blob_archive(make_test_toc());
 
-        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let mut reader = CustomDataReader::from_reader(Cursor::new(bytes)).unwrap();
         let err = reader.read_entry_reader(1).unwrap_err();
         assert!(
             matches!(err, Error::StreamingNotSupported(_)),
@@ -588,7 +559,7 @@ mod tests {
     fn test_custom_reader_invalid_dump_id() {
         let bytes = make_data_archive(make_test_toc(), b"data");
 
-        let mut reader = CustomReader::open(Cursor::new(bytes)).unwrap();
+        let mut reader = CustomDataReader::from_reader(Cursor::new(bytes)).unwrap();
         let err = reader.read_entry_data(999).unwrap_err();
         assert!(
             matches!(err, Error::InvalidDumpId(999)),
