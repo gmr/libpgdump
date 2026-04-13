@@ -4,9 +4,9 @@ pub mod dump;
 pub mod entry;
 pub mod error;
 pub mod format;
-pub mod header;
 pub mod io;
 mod sort;
+pub mod toc;
 pub mod types;
 pub mod version;
 
@@ -18,7 +18,7 @@ pub use error::{Error, Result};
 pub use format::custom::{
     CompressedEntryReader, CustomReader, EntryData, EntryReader, RawEntryReader,
 };
-pub use header::Header;
+pub use toc::TableOfContents;
 pub use types::{
     ArchiveData, Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
     Timestamp,

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::format::directory;
-use crate::header::Header;
+use crate::toc::TableOfContents;
 use crate::types::{ArchiveData, CompressionAlgorithm, Format};
 
 const TAR_BLOCK_SIZE: usize = 512;
@@ -41,9 +41,9 @@ pub fn read_archive(path: &Path) -> Result<ArchiveData> {
     let mut archive = directory::read_archive(tmp.path())?;
 
     // Fix format to Tar
-    archive.header = Header {
+    archive.toc = TableOfContents {
         format: Format::Tar,
-        ..archive.header
+        ..archive.toc
     };
 
     Ok(archive)
@@ -52,10 +52,8 @@ pub fn read_archive(path: &Path) -> Result<ArchiveData> {
 /// Write a tar format archive to the given path.
 pub fn write_archive(path: &Path, archive: &ArchiveData) -> Result<()> {
     // Tar format does not support compression
-    if archive.header.compression != CompressionAlgorithm::None {
-        return Err(Error::UnsupportedCompression(
-            archive.header.compression as u8,
-        ));
+    if archive.toc.compression != CompressionAlgorithm::None {
+        return Err(Error::UnsupportedCompression(archive.toc.compression as u8));
     }
 
     // Write to a temp directory first, then bundle into tar
@@ -63,9 +61,9 @@ pub fn write_archive(path: &Path, archive: &ArchiveData) -> Result<()> {
 
     // Write using directory format logic
     let dir_archive = ArchiveData {
-        header: Header {
+        toc: TableOfContents {
             format: Format::Tar, // toc.dat stores archTar
-            ..archive.header.clone()
+            ..archive.toc.clone()
         },
         ..archive.clone()
     };
@@ -260,22 +258,13 @@ mod tests {
     use crate::types::{Blob, ObjectType, OffsetState, Section, Timestamp};
     use crate::version::ArchiveVersion;
 
-    fn make_test_header() -> Header {
-        Header {
+    fn make_test_toc(entries: Vec<Entry>) -> TableOfContents {
+        TableOfContents {
             version: ArchiveVersion::new(1, 14, 0),
             int_size: 4,
             off_size: 8,
             format: Format::Tar,
             compression: CompressionAlgorithm::None,
-        }
-    }
-
-    #[test]
-    fn test_tar_round_trip_with_data() {
-        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
-
-        let mut archive = ArchiveData {
-            header: make_test_header(),
             timestamp: Timestamp {
                 second: 0,
                 minute: 0,
@@ -288,28 +277,38 @@ mod tests {
             dbname: "testdb".to_string(),
             server_version: "17.0".to_string(),
             dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
-            entries: vec![Entry {
-                dump_id: 1,
-                had_dumper: true,
-                table_oid: "16384".to_string(),
-                oid: "0".to_string(),
-                tag: Some("users".to_string()),
-                desc: ObjectType::TableData,
-                section: Section::Data,
-                defn: None,
-                drop_stmt: None,
-                copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
-                namespace: Some("public".to_string()),
-                tablespace: None,
-                tableam: None,
-                relkind: None,
-                owner: Some("postgres".to_string()),
-                with_oids: false,
-                dependencies: vec![],
-                data_state: OffsetState::NotSet,
-                offset: 0,
-                filename: Some("1.dat".to_string()),
-            }],
+            entries: entries,
+        }
+    }
+
+    #[test]
+    fn test_tar_round_trip_with_data() {
+        let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
+        let entries = vec![Entry {
+            dump_id: 1,
+            had_dumper: true,
+            table_oid: "16384".to_string(),
+            oid: "0".to_string(),
+            tag: Some("users".to_string()),
+            desc: ObjectType::TableData,
+            section: Section::Data,
+            defn: None,
+            drop_stmt: None,
+            copy_stmt: Some("COPY public.users (id, name, age) FROM stdin;\n".to_string()),
+            namespace: Some("public".to_string()),
+            tablespace: None,
+            tableam: None,
+            relkind: None,
+            owner: Some("postgres".to_string()),
+            with_oids: false,
+            dependencies: vec![],
+            data_state: OffsetState::NotSet,
+            offset: 0,
+            filename: Some("1.dat".to_string()),
+        }];
+        let original_toc = make_test_toc(entries);
+        let mut archive = ArchiveData {
+            toc: original_toc,
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
@@ -319,49 +318,36 @@ mod tests {
         write_archive(tmp.path(), &archive).unwrap();
 
         let parsed = read_archive(tmp.path()).unwrap();
-        assert_eq!(parsed.dbname, "testdb");
-        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.toc, archive.toc);
         assert_eq!(parsed.data.get(&1).unwrap(), data_content);
     }
 
     #[test]
     fn test_tar_round_trip_with_blobs() {
+        let entries = vec![Entry {
+            dump_id: 1,
+            had_dumper: true,
+            table_oid: "0".to_string(),
+            oid: "0".to_string(),
+            tag: None,
+            desc: ObjectType::Blobs,
+            section: Section::Data,
+            defn: None,
+            drop_stmt: None,
+            copy_stmt: None,
+            namespace: None,
+            tablespace: None,
+            tableam: None,
+            relkind: None,
+            owner: None,
+            with_oids: false,
+            dependencies: vec![],
+            data_state: OffsetState::NotSet,
+            offset: 0,
+            filename: Some("blobs_1.toc".to_string()),
+        }];
         let mut archive = ArchiveData {
-            header: make_test_header(),
-            timestamp: Timestamp {
-                second: 0,
-                minute: 0,
-                hour: 0,
-                day: 1,
-                month: 0,
-                year: 125,
-                is_dst: 0,
-            },
-            dbname: "testdb".to_string(),
-            server_version: "17.0".to_string(),
-            dump_version: "pg_dump (PostgreSQL) 17.0".to_string(),
-            entries: vec![Entry {
-                dump_id: 1,
-                had_dumper: true,
-                table_oid: "0".to_string(),
-                oid: "0".to_string(),
-                tag: None,
-                desc: ObjectType::Blobs,
-                section: Section::Data,
-                defn: None,
-                drop_stmt: None,
-                copy_stmt: None,
-                namespace: None,
-                tablespace: None,
-                tableam: None,
-                relkind: None,
-                owner: None,
-                with_oids: false,
-                dependencies: vec![],
-                data_state: OffsetState::NotSet,
-                offset: 0,
-                filename: Some("blobs_1.toc".to_string()),
-            }],
+            toc: make_test_toc(entries),
             data: HashMap::new(),
             blobs: HashMap::new(),
         };

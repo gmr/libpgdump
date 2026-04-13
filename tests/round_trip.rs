@@ -66,14 +66,14 @@ fn test_round_trip_uncompressed() {
     // Reload and compare
     let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
 
-    assert_eq!(dump.dbname(), reloaded.dbname());
-    assert_eq!(dump.server_version(), reloaded.server_version());
-    assert_eq!(dump.dump_version(), reloaded.dump_version());
-    assert_eq!(dump.version(), reloaded.version());
-    assert_eq!(dump.entries().len(), reloaded.entries().len());
+    assert_eq!(dump.toc.dbname, reloaded.toc.dbname);
+    assert_eq!(dump.toc.server_version, reloaded.toc.server_version);
+    assert_eq!(dump.toc.dump_version, reloaded.toc.dump_version);
+    assert_eq!(dump.toc.version, reloaded.toc.version);
+    assert_eq!(dump.toc.entries.len(), reloaded.toc.entries.len());
 
     // Compare entries by dump_id (order may differ due to topological sorting)
-    for orig in dump.entries().iter() {
+    for orig in dump.toc.entries.iter() {
         let reload = reloaded
             .get_entry(orig.dump_id)
             .unwrap_or_else(|| panic!("missing entry with dump_id {}", orig.dump_id));
@@ -165,8 +165,8 @@ fn test_round_trip_new_dump() {
 
     let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
 
-    assert_eq!(reloaded.dbname(), "testdb");
-    assert_eq!(reloaded.server_version(), "17.0");
+    assert_eq!(reloaded.toc.dbname, "testdb");
+    assert_eq!(reloaded.toc.server_version, "17.0");
 
     let rows: Vec<&str> = reloaded
         .table_data("public", "users")
@@ -246,7 +246,10 @@ fn test_round_trip_lz4_new_dump() {
     dump.save(tmp.path()).expect("failed to save dump");
 
     let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
-    assert_eq!(reloaded.compression(), libpgdump::CompressionAlgorithm::Lz4);
+    assert_eq!(
+        reloaded.toc.compression,
+        libpgdump::CompressionAlgorithm::Lz4
+    );
     let rows: Vec<&str> = reloaded
         .table_data("public", "items")
         .expect("failed to get table data")
@@ -286,7 +289,7 @@ fn test_round_trip_zstd_new_dump() {
 
     let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
     assert_eq!(
-        reloaded.compression(),
+        reloaded.toc.compression,
         libpgdump::CompressionAlgorithm::Zstd
     );
     let rows: Vec<&str> = reloaded
@@ -395,7 +398,7 @@ fn test_round_trip_directory_format() {
     assert!(tmp.path().join("toc.dat").exists());
 
     let reloaded = libpgdump::load(tmp.path()).expect("failed to reload directory dump");
-    assert_eq!(reloaded.dbname(), "testdb");
+    assert_eq!(reloaded.toc.dbname, "testdb");
 
     let rows: Vec<&str> = reloaded
         .table_data("public", "items")
@@ -438,7 +441,7 @@ fn test_round_trip_tar_format() {
     dump.save(tmp.path()).expect("failed to save tar dump");
 
     let reloaded = libpgdump::load(tmp.path()).expect("failed to reload tar dump");
-    assert_eq!(reloaded.dbname(), "testdb");
+    assert_eq!(reloaded.toc.dbname, "testdb");
 
     let rows: Vec<&str> = reloaded
         .table_data("public", "items")

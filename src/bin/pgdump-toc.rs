@@ -4,8 +4,8 @@ use std::path::Path;
 
 use libpgdump::dump::detect_file_format;
 use libpgdump::error::Result;
-use libpgdump::format::{ArchiveMetadata, custom, directory};
-use libpgdump::{Format, OffsetState};
+use libpgdump::format::{custom, directory};
+use libpgdump::{Format, OffsetState, TableOfContents};
 
 /// A simple utility to print archive header and TOC entries without loading data blocks.
 fn main() {
@@ -39,14 +39,14 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn load_metadata(path: &Path) -> Result<ArchiveMetadata> {
+fn load_metadata(path: &Path) -> Result<TableOfContents> {
     match detect_file_format(path)? {
         Format::Tar => Err(libpgdump::Error::UnsupportedFormat(Format::Tar as u8)),
         Format::Directory => directory::read_metadata(path),
         Format::Custom => {
             let file = File::open(path)?;
             let mut reader = BufReader::new(file);
-            custom::read_metadata(&mut reader)
+            custom::read_toc(&mut reader)
         }
         _ => unreachable!(
             "detect_file_format should only return Tar, Directory, or Custom for files"
@@ -54,17 +54,17 @@ fn load_metadata(path: &Path) -> Result<ArchiveMetadata> {
     }
 }
 
-fn print_metadata(path: &Path, metadata: &ArchiveMetadata) {
+fn print_metadata(path: &Path, metadata: &TableOfContents) {
     let ts = &metadata.timestamp;
     let year = ts.year + 1900;
     let month = ts.month + 1;
 
     println!("Archive: {}", path.display());
-    println!("  format: {:?}", metadata.header.format);
-    println!("  version: {}", metadata.header.version);
-    println!("  int_size: {}", metadata.header.int_size);
-    println!("  off_size: {}", metadata.header.off_size);
-    println!("  compression: {:?}", metadata.header.compression);
+    println!("  format: {:?}", metadata.format);
+    println!("  version: {}", metadata.version);
+    println!("  int_size: {}", metadata.int_size);
+    println!("  off_size: {}", metadata.off_size);
+    println!("  compression: {:?}", metadata.compression);
     println!("  dbname: {}", metadata.dbname);
     println!("  server_version: {}", metadata.server_version);
     println!("  dump_version: {}", metadata.dump_version);

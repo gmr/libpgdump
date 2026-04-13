@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use crate::entry::Entry;
-use crate::header::Header;
+use crate::toc::TableOfContents;
 
 /// Timestamp fields from the archive header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,12 +24,7 @@ pub struct Blob {
 /// Read result containing all parsed archive data.
 #[derive(Debug, Clone)]
 pub struct ArchiveData {
-    pub header: Header,
-    pub timestamp: Timestamp,
-    pub dbname: String,
-    pub server_version: String,
-    pub dump_version: String,
-    pub entries: Vec<Entry>,
+    pub toc: TableOfContents,
     /// Map of dump_id -> raw (decompressed) data bytes for TABLE DATA entries.
     pub data: HashMap<i32, Vec<u8>>,
     /// Map of dump_id -> list of blobs for BLOBS entries.

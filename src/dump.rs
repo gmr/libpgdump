@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 use crate::format::custom;
 use crate::format::directory;
 use crate::format::tar;
-use crate::header::Header;
 use crate::sort;
+use crate::toc::TableOfContents;
 use crate::types::{
     ArchiveData, Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Timestamp,
 };
@@ -18,12 +18,7 @@ use crate::version::{self, ArchiveVersion};
 /// A PostgreSQL dump archive.
 #[derive(Debug)]
 pub struct Dump {
-    pub(crate) header: Header,
-    pub(crate) timestamp: Timestamp,
-    pub(crate) dbname: String,
-    pub(crate) server_version: String,
-    pub(crate) dump_version: String,
-    pub(crate) entries: Vec<Entry>,
+    pub toc: TableOfContents,
     pub(crate) data: HashMap<i32, Vec<u8>>,
     pub(crate) blobs: HashMap<i32, Vec<Blob>>,
     next_dump_id: i32,
@@ -59,23 +54,21 @@ impl Dump {
         let archive_version = version::pg_version_to_archive_version(pg_major, pg_minor)
             .unwrap_or(ArchiveVersion::new(1, 14, 0));
 
-        let header = Header {
+        let toc = TableOfContents {
             version: archive_version,
             int_size: 4,
             off_size: 8,
             format: Format::Custom,
             compression: CompressionAlgorithm::None,
-        };
-
-        let now = now_timestamp();
-
-        let mut dump = Dump {
-            header,
-            timestamp: now,
+            timestamp: now_timestamp(),
             dbname: dbname.to_string(),
             server_version: appear_as.to_string(),
             dump_version: format!("pg_dump (PostgreSQL) {appear_as}"),
             entries: Vec::new(),
+        };
+
+        let mut dump = Dump {
+            toc,
             data: HashMap::new(),
             blobs: HashMap::new(),
             next_dump_id: 1,
@@ -117,14 +110,16 @@ impl Dump {
     }
 
     pub(crate) fn from_archive_data(archive: ArchiveData) -> Self {
-        let next_dump_id = archive.entries.iter().map(|e| e.dump_id).max().unwrap_or(0) + 1;
+        let next_dump_id = archive
+            .toc
+            .entries
+            .iter()
+            .map(|e| e.dump_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
         Dump {
-            header: archive.header,
-            timestamp: archive.timestamp,
-            dbname: archive.dbname,
-            server_version: archive.server_version,
-            dump_version: archive.dump_version,
-            entries: archive.entries,
+            toc: archive.toc,
             data: archive.data,
             blobs: archive.blobs,
             next_dump_id,
@@ -140,9 +135,9 @@ impl Dump {
         let path = path.as_ref();
         let archive = self.to_archive_data();
 
-        if self.header.format == Format::Directory {
+        if self.toc.format == Format::Directory {
             directory::write_archive(path, &archive)
-        } else if self.header.format == Format::Tar {
+        } else if self.toc.format == Format::Tar {
             tar::write_archive(path, &archive)
         } else {
             let tmp_path = path.with_extension("tmp");
@@ -174,20 +169,20 @@ impl Dump {
     /// Note: Tar format does not support compression. If compression is set
     /// when switching to tar format, it will be reset to `None`.
     pub fn set_format(&mut self, format: Format) {
-        if format == Format::Tar && self.header.compression != CompressionAlgorithm::None {
-            self.header.compression = CompressionAlgorithm::None;
+        if format == Format::Tar && self.toc.compression != CompressionAlgorithm::None {
+            self.toc.compression = CompressionAlgorithm::None;
         }
-        self.header.format = format;
+        self.toc.format = format;
     }
 
     fn to_archive_data(&self) -> ArchiveData {
-        let mut entries = self.entries.clone();
+        let mut entries = self.toc.entries.clone();
 
         // Sort entries using weighted topological sort (matching pg_dump)
         sort::sort_entries(&mut entries);
 
         // For directory and tar formats, ensure entries have filenames
-        if self.header.format == Format::Directory || self.header.format == Format::Tar {
+        if self.toc.format == Format::Directory || self.toc.format == Format::Tar {
             for entry in &mut entries {
                 if entry.filename.is_none() {
                     if self.data.contains_key(&entry.dump_id) {
@@ -199,13 +194,11 @@ impl Dump {
             }
         }
 
+        let mut toc = self.toc.clone();
+        toc.entries = entries;
+
         ArchiveData {
-            header: self.header.clone(),
-            timestamp: self.timestamp.clone(),
-            dbname: self.dbname.clone(),
-            server_version: self.server_version.clone(),
-            dump_version: self.dump_version.clone(),
-            entries,
+            toc,
             data: self.data.clone(),
             blobs: self.blobs.clone(),
         }
@@ -213,44 +206,9 @@ impl Dump {
 
     // -- Accessors --
 
-    /// The archive format version.
-    pub fn version(&self) -> ArchiveVersion {
-        self.header.version
-    }
-
-    /// The compression algorithm used.
-    pub fn compression(&self) -> CompressionAlgorithm {
-        self.header.compression
-    }
-
-    /// The database name.
-    pub fn dbname(&self) -> &str {
-        &self.dbname
-    }
-
-    /// The PostgreSQL server version string.
-    pub fn server_version(&self) -> &str {
-        &self.server_version
-    }
-
-    /// The pg_dump version string.
-    pub fn dump_version(&self) -> &str {
-        &self.dump_version
-    }
-
-    /// The archive creation timestamp.
-    pub fn timestamp(&self) -> &Timestamp {
-        &self.timestamp
-    }
-
-    /// All TOC entries.
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
     /// Look up an entry by object type, namespace, and tag.
     pub fn lookup_entry(&self, desc: &ObjectType, namespace: &str, tag: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| {
+        self.toc.entries.iter().find(|e| {
             e.desc == *desc
                 && e.namespace.as_deref() == Some(namespace)
                 && e.tag.as_deref() == Some(tag)
@@ -259,12 +217,12 @@ impl Dump {
 
     /// Get an entry by dump_id.
     pub fn get_entry(&self, dump_id: i32) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.dump_id == dump_id)
+        self.toc.entries.iter().find(|e| e.dump_id == dump_id)
     }
 
     /// Get a mutable reference to an entry by dump_id.
     pub fn get_entry_mut(&mut self, dump_id: i32) -> Option<&mut Entry> {
-        self.entries.iter_mut().find(|e| e.dump_id == dump_id)
+        self.toc.entries.iter_mut().find(|e| e.dump_id == dump_id)
     }
 
     /// Iterate over table data rows for the given namespace and table.
@@ -272,6 +230,7 @@ impl Dump {
     /// Each yielded item is a line from the COPY data (without the trailing newline).
     pub fn table_data(&self, namespace: &str, table: &str) -> Result<impl Iterator<Item = &str>> {
         let entry = self
+            .toc
             .entries
             .iter()
             .find(|e| {
@@ -304,7 +263,7 @@ impl Dump {
     /// `data` is the decompressed blob content.
     pub fn blobs(&self) -> Vec<(i32, &[u8])> {
         let mut result = Vec::new();
-        for entry in &self.entries {
+        for entry in &self.toc.entries {
             if (entry.desc == ObjectType::Blobs || entry.desc == ObjectType::Blob)
                 && let Some(blob_list) = self.blobs.get(&entry.dump_id)
             {
@@ -323,6 +282,7 @@ impl Dump {
     pub fn add_blob(&mut self, oid: i32, data: Vec<u8>) -> Result<i32> {
         // Find or create a BLOBS entry
         let blobs_dump_id = if let Some(entry) = self
+            .toc
             .entries
             .iter()
             .find(|e| e.desc == ObjectType::Blobs && e.had_dumper)
@@ -332,6 +292,7 @@ impl Dump {
             let dump_id =
                 self.add_entry(ObjectType::Blobs, None, None, None, None, None, None, &[])?;
             let entry = self
+                .toc
                 .entries
                 .iter_mut()
                 .find(|e| e.dump_id == dump_id)
@@ -394,13 +355,14 @@ impl Dump {
             offset: 0,
             filename: None,
         };
-        self.entries.push(entry);
+        self.toc.entries.push(entry);
         Ok(dump_id)
     }
 
     /// Set the data for an entry (raw COPY format bytes).
     pub fn set_entry_data(&mut self, dump_id: i32, data: Vec<u8>) -> Result<()> {
         let entry = self
+            .toc
             .entries
             .iter_mut()
             .find(|e| e.dump_id == dump_id)
@@ -413,7 +375,7 @@ impl Dump {
 
     /// Set compression algorithm for writing.
     pub fn set_compression(&mut self, alg: CompressionAlgorithm) {
-        self.header.compression = alg;
+        self.toc.compression = alg;
     }
 
     /// Sort TOC entries using the same weighted topological sort as pg_dump.
@@ -426,7 +388,7 @@ impl Dump {
     /// This is called automatically by [`Dump::save`], but can also be called
     /// manually if you need the sorted order before writing.
     pub fn sort_entries(&mut self) {
-        sort::sort_entries(&mut self.entries);
+        sort::sort_entries(&mut self.toc.entries);
     }
 }
 /// Directories are always treated as directory format.
