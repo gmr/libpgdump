@@ -14,10 +14,7 @@ fn test_load_uncompressed() {
     assert!(!dump.toc.dump_version.is_empty());
     assert!(!dump.toc.entries.is_empty());
 
-    assert_eq!(
-        dump.toc.compression,
-        libpgdump::CompressionAlgorithm::None
-    );
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::None);
 
     // Should have ENCODING, STDSTRINGS, SEARCHPATH entries
     let has_encoding = dump
@@ -47,10 +44,7 @@ fn test_load_compressed() {
 
     assert!(!dump.toc.dbname.is_empty());
     assert!(!dump.toc.entries.is_empty());
-    assert_eq!(
-        dump.toc.compression,
-        libpgdump::CompressionAlgorithm::Gzip
-    );
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::Gzip);
 
     // TABLE DATA entries should exist and have data
     let table_data_count = dump
@@ -194,11 +188,7 @@ fn test_entry_dependencies() {
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
     // TABLE DATA entries typically depend on their TABLE entry
-    let has_deps = dump
-        .toc
-        .entries
-        .iter()
-        .any(|e| !e.dependencies.is_empty());
+    let has_deps = dump.toc.entries.iter().any(|e| !e.dependencies.is_empty());
     assert!(has_deps, "some entries should have dependencies");
 }
 
@@ -213,10 +203,7 @@ fn test_load_directory() {
     assert!(!dump.toc.dbname.is_empty());
     assert!(!dump.toc.server_version.is_empty());
     assert!(!dump.toc.entries.is_empty());
-    assert_eq!(
-        dump.toc.compression,
-        libpgdump::CompressionAlgorithm::None
-    );
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::None);
 
     let table_data_count = dump
         .toc
@@ -240,10 +227,7 @@ fn test_load_directory_compressed() {
 
     assert!(!dump.toc.dbname.is_empty());
     assert!(!dump.toc.entries.is_empty());
-    assert_eq!(
-        dump.toc.compression,
-        libpgdump::CompressionAlgorithm::Gzip
-    );
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::Gzip);
 
     let rows: Vec<&str> = dump
         .table_data("public", "pgbench_accounts")

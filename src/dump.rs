@@ -21,7 +21,6 @@ pub struct Dump {
     pub toc: TableOfContents,
     pub(crate) data: HashMap<i32, Vec<u8>>,
     pub(crate) blobs: HashMap<i32, Vec<Blob>>,
-    next_dump_id: i32,
 }
 
 impl Dump {
@@ -71,7 +70,6 @@ impl Dump {
             toc,
             data: HashMap::new(),
             blobs: HashMap::new(),
-            next_dump_id: 1,
         };
 
         // Add standard initial entries like pgdumplib does
@@ -110,19 +108,10 @@ impl Dump {
     }
 
     pub(crate) fn from_archive_data(archive: ArchiveData) -> Self {
-        let next_dump_id = archive
-            .toc
-            .entries
-            .iter()
-            .map(|e| e.dump_id)
-            .max()
-            .unwrap_or(0)
-            + 1;
         Dump {
             toc: archive.toc,
             data: archive.data,
             blobs: archive.blobs,
-            next_dump_id,
         }
     }
 
@@ -202,6 +191,16 @@ impl Dump {
             data: self.data.clone(),
             blobs: self.blobs.clone(),
         }
+    }
+
+    fn derive_next_dump_id(&self) -> i32 {
+        self.toc
+            .entries
+            .iter()
+            .map(|e| e.dump_id)
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
     // -- Accessors --
@@ -329,8 +328,7 @@ impl Dump {
         copy_stmt: Option<&str>,
         dependencies: &[i32],
     ) -> Result<i32> {
-        let dump_id = self.next_dump_id;
-        self.next_dump_id += 1;
+        let dump_id = self.derive_next_dump_id();
 
         let section = desc.section();
         let entry = Entry {
