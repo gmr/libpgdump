@@ -1,6 +1,6 @@
 # libpgdump
 
-A Rust library for reading and writing PostgreSQL dump files.
+A Rust library for reading and writing PostgreSQL dumps.
 
 Supports all three pg_dump formats: **custom** (`-Fc`), **directory** (`-Fd`),
 and **tar** (`-Ft`).

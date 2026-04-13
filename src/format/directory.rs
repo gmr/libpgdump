@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::compress;
 use crate::constants::MAGIC;
+use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::io::primitives::{
@@ -13,19 +14,19 @@ use crate::io::primitives::{
 };
 use crate::toc::TableOfContents;
 use crate::types::{
-    ArchiveData, Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section, Timestamp,
+    Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section, Timestamp,
 };
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 use flate2::read::GzDecoder;
 
-/// Read a directory format archive from the given path.
-pub fn read_archive(dir: &Path) -> Result<ArchiveData> {
+/// Read a directory format dump from the given path.
+pub fn read_dump(dir: &Path) -> Result<Dump> {
     let toc = read_metadata(dir)?;
 
     // Read data files and blobs from the directory
     let (data, blobs) = read_data_files(dir, &toc, &toc.entries)?;
 
-    Ok(ArchiveData { toc, data, blobs })
+    Ok(Dump { toc, data, blobs })
 }
 
 /// Read only archive metadata (header and TOC) from a directory archive.
@@ -77,8 +78,8 @@ pub(crate) fn read_toc_data(toc_data: &[u8], format: Format) -> Result<TableOfCo
     })
 }
 
-/// Write a directory format archive to the given path.
-pub fn write_archive(dir: &Path, archive: &ArchiveData) -> Result<()> {
+/// Write a [Dump] to the given path in directory format.
+pub fn write_dump(dir: &Path, dump: &Dump) -> Result<()> {
     fs::create_dir_all(dir)?;
 
     // Write toc.dat (uses archTar format code per pg_dump convention)
@@ -87,28 +88,24 @@ pub fn write_archive(dir: &Path, archive: &ArchiveData) -> Result<()> {
 
     let toc_header = TableOfContents {
         format: Format::Tar, // directory format writes archTar in toc.dat
-        ..archive.toc.clone()
+        ..dump.toc.clone()
     };
 
     write_header(&mut toc_file, &toc_header)?;
-    write_timestamp(&mut toc_file, &archive.toc.timestamp, toc_header.int_size)?;
+    write_timestamp(&mut toc_file, &dump.toc.timestamp, toc_header.int_size)?;
+    write_string(&mut toc_file, Some(&dump.toc.dbname), toc_header.int_size)?;
     write_string(
         &mut toc_file,
-        Some(&archive.toc.dbname),
+        Some(&dump.toc.server_version),
         toc_header.int_size,
     )?;
     write_string(
         &mut toc_file,
-        Some(&archive.toc.server_version),
-        toc_header.int_size,
-    )?;
-    write_string(
-        &mut toc_file,
-        Some(&archive.toc.dump_version),
+        Some(&dump.toc.dump_version),
         toc_header.int_size,
     )?;
 
-    let entry_count: i32 = archive
+    let entry_count: i32 = dump
         .toc
         .entries
         .len()
@@ -116,23 +113,23 @@ pub fn write_archive(dir: &Path, archive: &ArchiveData) -> Result<()> {
         .map_err(|_| Error::DataIntegrity("too many entries for i32".to_string()))?;
     write_int(&mut toc_file, entry_count, toc_header.int_size)?;
 
-    for entry in &archive.toc.entries {
+    for entry in &dump.toc.entries {
         write_entry(&mut toc_file, entry, &toc_header)?;
     }
 
     // Write data files
-    for entry in &archive.toc.entries {
-        if let Some(data) = archive.data.get(&entry.dump_id) {
-            let filename = data_filename(entry.dump_id, archive.toc.compression);
+    for entry in &dump.toc.entries {
+        if let Some(data) = dump.data.get(&entry.dump_id) {
+            let filename = data_filename(entry.dump_id, dump.toc.compression);
             let file_path = dir.join(&filename);
-            write_data_file(&file_path, &archive.toc, data)?;
+            write_data_file(&file_path, &dump.toc, data)?;
         }
     }
 
     // Write blob files
-    for entry in &archive.toc.entries {
-        if let Some(blob_list) = archive.blobs.get(&entry.dump_id) {
-            write_blob_files(dir, &archive.toc, entry.dump_id, blob_list)?;
+    for entry in &dump.toc.entries {
+        if let Some(blob_list) = dump.blobs.get(&entry.dump_id) {
+            write_blob_files(dir, &dump.toc, entry.dump_id, blob_list)?;
         }
     }
 
@@ -654,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_directory_round_trip_no_data() {
-        let archive = ArchiveData {
+        let dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -685,9 +682,9 @@ mod tests {
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
-        write_archive(tmp.path(), &archive).unwrap();
+        write_dump(tmp.path(), &dump).unwrap();
 
-        let parsed = read_archive(tmp.path()).unwrap();
+        let parsed = read_dump(tmp.path()).unwrap();
         assert_eq!(parsed.toc.dbname, "testdb");
         assert_eq!(parsed.toc.entries.len(), 1);
         assert_eq!(parsed.toc.entries[0].desc, ObjectType::Encoding);
@@ -695,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_directory_round_trip_unknown_desc() {
-        let archive = ArchiveData {
+        let dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -726,9 +723,9 @@ mod tests {
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
-        write_archive(tmp.path(), &archive).unwrap();
+        write_dump(tmp.path(), &dump).unwrap();
 
-        let parsed = read_archive(tmp.path()).unwrap();
+        let parsed = read_dump(tmp.path()).unwrap();
         assert_eq!(parsed.toc.entries.len(), 1);
         assert_eq!(
             parsed.toc.entries[0].desc,
@@ -740,7 +737,7 @@ mod tests {
     fn test_directory_round_trip_with_data() {
         let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
 
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -769,23 +766,23 @@ mod tests {
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.data.insert(1, data_content.to_vec());
+        dump.data.insert(1, data_content.to_vec());
 
         let tmp = tempfile::TempDir::new().unwrap();
-        write_archive(tmp.path(), &archive).unwrap();
+        write_dump(tmp.path(), &dump).unwrap();
 
         // Verify files exist
         assert!(tmp.path().join("toc.dat").exists());
         assert!(tmp.path().join("1.dat").exists());
 
-        let parsed = read_archive(tmp.path()).unwrap();
+        let parsed = read_dump(tmp.path()).unwrap();
         assert_eq!(parsed.toc.entries.len(), 1);
         assert_eq!(parsed.data.get(&1).unwrap(), data_content);
     }
 
     #[test]
     fn test_directory_round_trip_with_blobs() {
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -814,7 +811,7 @@ mod tests {
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.blobs.insert(
+        dump.blobs.insert(
             1,
             vec![
                 Blob {
@@ -829,14 +826,14 @@ mod tests {
         );
 
         let tmp = tempfile::TempDir::new().unwrap();
-        write_archive(tmp.path(), &archive).unwrap();
+        write_dump(tmp.path(), &dump).unwrap();
 
         // Verify files exist
         assert!(tmp.path().join("blobs_1.toc").exists());
         assert!(tmp.path().join("blob_16601.dat").exists());
         assert!(tmp.path().join("blob_16602.dat").exists());
 
-        let parsed = read_archive(tmp.path()).unwrap();
+        let parsed = read_dump(tmp.path()).unwrap();
         let blobs = parsed.blobs.get(&1).unwrap();
         assert_eq!(blobs.len(), 2);
         assert_eq!(blobs[0].oid, 16601);

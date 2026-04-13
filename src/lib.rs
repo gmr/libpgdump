@@ -20,8 +20,7 @@ pub use format::custom::{
 };
 pub use toc::TableOfContents;
 pub use types::{
-    ArchiveData, Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
-    Timestamp,
+    Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section, Timestamp,
 };
 pub use version::ArchiveVersion;
 

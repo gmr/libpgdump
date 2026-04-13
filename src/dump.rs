@@ -10,13 +10,11 @@ use crate::format::directory;
 use crate::format::tar;
 use crate::sort;
 use crate::toc::TableOfContents;
-use crate::types::{
-    ArchiveData, Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Timestamp,
-};
+use crate::types::{Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Timestamp};
 use crate::version::{self, ArchiveVersion};
 
 /// A PostgreSQL dump archive.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Dump {
     pub toc: TableOfContents,
     pub(crate) data: HashMap<i32, Vec<u8>>,
@@ -24,7 +22,7 @@ pub struct Dump {
 }
 
 impl Dump {
-    /// Load a dump from a file or directory.
+    /// Load a [Dump] from a file or directory.
     ///
     /// Automatically detects the format:
     /// - Directory → directory format (`-Fd`)
@@ -32,19 +30,19 @@ impl Dump {
     /// - File with ustar header → tar format (`-Ft`)
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let archive = match detect_file_format(path)? {
-            Format::Tar => tar::read_archive(path)?,
-            Format::Directory => directory::read_archive(path)?,
+        let dump = match detect_file_format(path)? {
+            Format::Tar => tar::read_dump(path)?,
+            Format::Directory => directory::read_dump(path)?,
             Format::Custom => {
                 let file = File::open(path)?;
                 let mut reader = BufReader::new(file);
-                custom::read_archive(&mut reader)?
+                custom::read_dump(&mut reader)?
             }
             Format::Files => unreachable!(),
             Format::Null => unreachable!(),
             Format::Unknown => unreachable!(),
         };
-        Ok(Self::from_archive_data(archive))
+        Ok(dump)
     }
 
     /// Create a new empty dump.
@@ -107,14 +105,6 @@ impl Dump {
         Ok(dump)
     }
 
-    pub(crate) fn from_archive_data(archive: ArchiveData) -> Self {
-        Dump {
-            toc: archive.toc,
-            data: archive.data,
-            blobs: archive.blobs,
-        }
-    }
-
     /// Save the dump to a file or directory.
     ///
     /// For custom format (`-Fc`), writes to a temporary file first, then
@@ -122,18 +112,18 @@ impl Dump {
     /// For directory format (`-Fd`), writes directly to the directory.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let archive = self.to_archive_data();
+        let dump = self.prepare_for_save();
 
         if self.toc.format == Format::Directory {
-            directory::write_archive(path, &archive)
+            directory::write_dump(path, &dump)
         } else if self.toc.format == Format::Tar {
-            tar::write_archive(path, &archive)
+            tar::write_dump(path, &dump)
         } else {
             let tmp_path = path.with_extension("tmp");
             let result = (|| {
                 let file = File::create(&tmp_path)?;
                 let mut writer = BufWriter::new(file);
-                custom::write_archive(&mut writer, &archive)?;
+                custom::write_dump(&mut writer, &dump)?;
                 writer
                     .into_inner()
                     .map_err(|e| Error::Io(e.into_error()))?
@@ -164,14 +154,15 @@ impl Dump {
         self.toc.format = format;
     }
 
-    fn to_archive_data(&self) -> ArchiveData {
-        let mut entries = self.toc.entries.clone();
+    fn prepare_for_save(&self) -> Self {
+        let mut toc = self.toc.clone();
+        let mut entries = toc.entries.clone();
 
         // Sort entries using weighted topological sort (matching pg_dump)
         sort::sort_entries(&mut entries);
 
         // For directory and tar formats, ensure entries have filenames
-        if self.toc.format == Format::Directory || self.toc.format == Format::Tar {
+        if toc.format == Format::Directory || toc.format == Format::Tar {
             for entry in &mut entries {
                 if entry.filename.is_none() {
                     if self.data.contains_key(&entry.dump_id) {
@@ -182,11 +173,9 @@ impl Dump {
                 }
             }
         }
-
-        let mut toc = self.toc.clone();
         toc.entries = entries;
 
-        ArchiveData {
+        Dump {
             toc,
             data: self.data.clone(),
             blobs: self.blobs.clone(),

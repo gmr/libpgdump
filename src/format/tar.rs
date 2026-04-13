@@ -1,15 +1,16 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::dump::Dump;
 use crate::error::{Error, Result};
 use crate::format::directory;
 use crate::toc::TableOfContents;
-use crate::types::{ArchiveData, CompressionAlgorithm, Format};
+use crate::types::{CompressionAlgorithm, Format};
 
 const TAR_BLOCK_SIZE: usize = 512;
 
-/// Read a tar format archive from the given path.
-pub fn read_archive(path: &Path) -> Result<ArchiveData> {
+/// Read a tar format [Dump] from the given path.
+pub fn read_dump(path: &Path) -> Result<Dump> {
     let tar_data = std::fs::read(path)?;
     let members = parse_tar(&tar_data)?;
 
@@ -38,36 +39,36 @@ pub fn read_archive(path: &Path) -> Result<ArchiveData> {
         std::fs::write(&file_path, &member.data)?;
     }
 
-    let mut archive = directory::read_archive(tmp.path())?;
+    let mut dump = directory::read_dump(tmp.path())?;
 
     // Fix format to Tar
-    archive.toc = TableOfContents {
+    dump.toc = TableOfContents {
         format: Format::Tar,
-        ..archive.toc
+        ..dump.toc
     };
 
-    Ok(archive)
+    Ok(dump)
 }
 
-/// Write a tar format archive to the given path.
-pub fn write_archive(path: &Path, archive: &ArchiveData) -> Result<()> {
+/// Write a [Dump] to the given path in tar format.
+pub fn write_dump(path: &Path, dump: &Dump) -> Result<()> {
     // Tar format does not support compression
-    if archive.toc.compression != CompressionAlgorithm::None {
-        return Err(Error::UnsupportedCompression(archive.toc.compression as u8));
+    if dump.toc.compression != CompressionAlgorithm::None {
+        return Err(Error::UnsupportedCompression(dump.toc.compression as u8));
     }
 
     // Write to a temp directory first, then bundle into tar
     let tmp = tempfile::TempDir::new().map_err(Error::Io)?;
 
     // Write using directory format logic
-    let dir_archive = ArchiveData {
+    let dir_dump = Dump {
         toc: TableOfContents {
             format: Format::Tar, // toc.dat stores archTar
-            ..archive.toc.clone()
+            ..dump.toc.clone()
         },
-        ..archive.clone()
+        ..dump.clone()
     };
-    directory::write_archive(tmp.path(), &dir_archive)?;
+    directory::write_dump(tmp.path(), &dir_dump)?;
 
     // Bundle directory contents into tar
     let file = std::fs::File::create(path)?;
@@ -307,18 +308,18 @@ mod tests {
             filename: Some("1.dat".to_string()),
         }];
         let original_toc = make_test_toc(entries);
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: original_toc,
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.data.insert(1, data_content.to_vec());
+        dump.data.insert(1, data_content.to_vec());
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_archive(tmp.path(), &archive).unwrap();
+        write_dump(tmp.path(), &dump).unwrap();
 
-        let parsed = read_archive(tmp.path()).unwrap();
-        assert_eq!(parsed.toc, archive.toc);
+        let parsed = read_dump(tmp.path()).unwrap();
+        assert_eq!(parsed.toc, dump.toc);
         assert_eq!(parsed.data.get(&1).unwrap(), data_content);
     }
 
@@ -346,12 +347,12 @@ mod tests {
             offset: 0,
             filename: Some("blobs_1.toc".to_string()),
         }];
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: make_test_toc(entries),
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.blobs.insert(
+        dump.blobs.insert(
             1,
             vec![
                 Blob {
@@ -366,9 +367,9 @@ mod tests {
         );
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_archive(tmp.path(), &archive).unwrap();
+        write_dump(tmp.path(), &dump).unwrap();
 
-        let parsed = read_archive(tmp.path()).unwrap();
+        let parsed = read_dump(tmp.path()).unwrap();
         let blobs = parsed.blobs.get(&1).unwrap();
         assert_eq!(blobs.len(), 2);
         assert_eq!(blobs[0].oid, 100);

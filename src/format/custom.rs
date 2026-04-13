@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::compress;
 use crate::constants::MAGIC;
+use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::io::primitives::{
@@ -13,7 +14,7 @@ use crate::toc::TableOfContents;
 use crate::types::{BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section};
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 
-pub use crate::types::{ArchiveData, Blob, Timestamp};
+pub use crate::types::{Blob, Timestamp};
 
 /// The data content of a TOC entry, read on demand from a [`CustomReader`].
 #[derive(Debug)]
@@ -24,21 +25,21 @@ pub enum EntryData {
     Blobs(Vec<Blob>),
 }
 
-/// Read a custom format archive from a reader.
-pub fn read_archive<R: Read + Seek>(r: &mut R) -> Result<ArchiveData> {
+/// Read a custom format [Dump] from a reader.
+pub fn read_dump<R: Read + Seek>(r: &mut R) -> Result<Dump> {
     let toc = read_toc(r)?;
 
     // Read data blocks by seeking to each entry's offset
     let (data, blobs) = read_data_blocks(r, &toc, &toc.entries)?;
 
-    Ok(ArchiveData { toc, data, blobs })
+    Ok(Dump { toc, data, blobs })
 }
 
-/// A lazy reader for custom format (`-Fc`) PostgreSQL dump archives.
+/// A lazy reader for custom format (`-Fc`) PostgreSQL dumps.
 ///
 /// Parses the header and TOC entries on construction, but defers reading
 /// data blocks until explicitly requested. This allows working with
-/// archives too large to fit in memory.
+/// dumps too large to fit in memory.
 ///
 /// # Example
 ///
@@ -184,13 +185,11 @@ impl<R: Read + Seek> CustomReader<R> {
     /// inspecting the TOC first before deciding to load everything.
     pub fn into_dump(mut self) -> Result<crate::dump::Dump> {
         let (data, blobs) = read_data_blocks(&mut self.reader, &self.toc, &self.toc.entries)?;
-        let archive = ArchiveData {
+        Ok(crate::dump::Dump {
             toc: self.toc,
             data,
             blobs,
-        };
-
-        Ok(crate::dump::Dump::from_archive_data(archive))
+        })
     }
 }
 
@@ -349,7 +348,7 @@ impl<R: Read> Read for RawEntryReader<'_, R> {
 }
 
 /// Read the header, timestamp, metadata strings, and all TOC entries.
-/// Shared by `read_archive` (eager) and `CustomReader::open` (lazy).
+/// Shared by `read_dump` (eager) and `CustomReader::open` (lazy).
 pub fn read_toc<R: Read>(r: &mut R) -> Result<TableOfContents> {
     let toc = read_header(r)?;
     let int_size = toc.int_size;
@@ -659,46 +658,46 @@ fn read_compressed_data<R: Read>(r: &mut R, header: &TableOfContents) -> Result<
     Ok(decompressed_data)
 }
 
-/// Write a custom format archive.
-pub fn write_archive<W: std::io::Write + Seek>(w: &mut W, archive: &ArchiveData) -> Result<()> {
-    let int_size = archive.toc.int_size;
-    let off_size = archive.toc.off_size;
+/// Write a [Dump] to a writer in custom format (as in using `-Fc` with pg_dump).
+pub fn write_dump<W: std::io::Write + Seek>(w: &mut W, dump: &Dump) -> Result<()> {
+    let int_size = dump.toc.int_size;
+    let off_size = dump.toc.off_size;
 
-    write_header(w, &archive.toc)?;
+    write_header(w, &dump.toc)?;
 
     // Write compression for pre-1.15 (handled inside write_header)
 
-    write_timestamp(w, &archive.toc.timestamp, int_size)?;
-    write_string(w, Some(&archive.toc.dbname), int_size)?;
-    write_string(w, Some(&archive.toc.server_version), int_size)?;
-    write_string(w, Some(&archive.toc.dump_version), int_size)?;
+    write_timestamp(w, &dump.toc.timestamp, int_size)?;
+    write_string(w, Some(&dump.toc.dbname), int_size)?;
+    write_string(w, Some(&dump.toc.server_version), int_size)?;
+    write_string(w, Some(&dump.toc.dump_version), int_size)?;
 
     // Write entry count
-    write_int(w, archive.toc.entries.len() as i32, int_size)?;
+    write_int(w, dump.toc.entries.len() as i32, int_size)?;
 
     // First pass: write entries with placeholder offsets, recording positions
     let mut offset_positions = Vec::new();
-    for entry in &archive.toc.entries {
-        offset_positions.push(write_entry(w, entry, &archive.toc)?);
+    for entry in &dump.toc.entries {
+        offset_positions.push(write_entry(w, entry, &dump.toc)?);
     }
 
     // Write data blocks and record actual offsets
     let mut actual_offsets: HashMap<i32, u64> = HashMap::new();
-    for entry in &archive.toc.entries {
+    for entry in &dump.toc.entries {
         // Check for blob data first, then regular data
-        if let Some(blobs) = archive.blobs.get(&entry.dump_id) {
+        if let Some(blobs) = dump.blobs.get(&entry.dump_id) {
             let pos = w.stream_position()?;
             actual_offsets.insert(entry.dump_id, pos);
-            write_blob_block(w, &archive.toc, entry.dump_id, blobs)?;
-        } else if let Some(data) = archive.data.get(&entry.dump_id) {
+            write_blob_block(w, &dump.toc, entry.dump_id, blobs)?;
+        } else if let Some(data) = dump.data.get(&entry.dump_id) {
             let pos = w.stream_position()?;
             actual_offsets.insert(entry.dump_id, pos);
-            write_data_block(w, &archive.toc, entry.dump_id, data)?;
+            write_data_block(w, &dump.toc, entry.dump_id, data)?;
         }
     }
 
     // Second pass: go back and fix the offsets
-    for (i, entry) in archive.toc.entries.iter().enumerate() {
+    for (i, entry) in dump.toc.entries.iter().enumerate() {
         let offset_file_pos = offset_positions[i];
         if let Some(&actual_offset) = actual_offsets.get(&entry.dump_id) {
             w.seek(SeekFrom::Start(offset_file_pos))?;
@@ -937,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_full_archive_round_trip_no_data() {
-        let archive = ArchiveData {
+        let dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -968,10 +967,10 @@ mod tests {
         };
 
         let mut buf = Cursor::new(Vec::new());
-        write_archive(&mut buf, &archive).unwrap();
+        write_dump(&mut buf, &dump).unwrap();
 
         buf.seek(SeekFrom::Start(0)).unwrap();
-        let parsed = read_archive(&mut buf).unwrap();
+        let parsed = read_dump(&mut buf).unwrap();
 
         assert_eq!(parsed.toc.dbname, "testdb");
         assert_eq!(parsed.toc.server_version, "17.0");
@@ -988,7 +987,7 @@ mod tests {
     fn test_custom_reader_open() {
         // Build an archive with one no-data entry and one data entry
         let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: TableOfContents {
                 entries: vec![
                     Entry {
@@ -1043,10 +1042,10 @@ mod tests {
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.data.insert(2, data_content.to_vec());
+        dump.data.insert(2, data_content.to_vec());
 
         let mut buf = Cursor::new(Vec::new());
-        write_archive(&mut buf, &archive).unwrap();
+        write_dump(&mut buf, &dump).unwrap();
 
         // Open with CustomReader — should parse header + TOC only
         buf.seek(SeekFrom::Start(0)).unwrap();
@@ -1077,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_custom_reader_no_data_entry() {
-        let archive = ArchiveData {
+        let dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -1108,7 +1107,7 @@ mod tests {
         };
 
         let mut buf = Cursor::new(Vec::new());
-        write_archive(&mut buf, &archive).unwrap();
+        write_dump(&mut buf, &dump).unwrap();
 
         buf.seek(SeekFrom::Start(0)).unwrap();
         let mut reader = CustomReader::open(buf).unwrap();
@@ -1159,15 +1158,12 @@ mod tests {
 
     #[test]
     fn test_custom_reader_into_dump() {
-        use crate::Dump;
-
         let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
         let archive_bytes = make_data_archive(make_test_header(), data_content);
 
         // Load via Dump (eager) for comparison
         let mut eager_cursor = Cursor::new(archive_bytes.clone());
-        let eager_archive = read_archive(&mut eager_cursor).unwrap();
-        let eager_dump = Dump::from_archive_data(eager_archive);
+        let eager_dump = read_dump(&mut eager_cursor).unwrap();
 
         // Load via CustomReader -> into_dump
         let lazy_reader = CustomReader::open(Cursor::new(archive_bytes)).unwrap();
@@ -1197,7 +1193,7 @@ mod tests {
     }
 
     fn make_data_archive(header: TableOfContents, data: &[u8]) -> Vec<u8> {
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -1226,14 +1222,14 @@ mod tests {
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.data.insert(1, data.to_vec());
+        dump.data.insert(1, data.to_vec());
         let mut buf = Cursor::new(Vec::new());
-        write_archive(&mut buf, &archive).unwrap();
+        write_dump(&mut buf, &dump).unwrap();
         buf.into_inner()
     }
 
     fn make_blob_archive(header: TableOfContents) -> Vec<u8> {
-        let mut archive = ArchiveData {
+        let mut dump = Dump {
             toc: TableOfContents {
                 entries: vec![Entry {
                     dump_id: 1,
@@ -1262,7 +1258,7 @@ mod tests {
             data: HashMap::new(),
             blobs: HashMap::new(),
         };
-        archive.blobs.insert(
+        dump.blobs.insert(
             1,
             vec![
                 Blob {
@@ -1276,7 +1272,7 @@ mod tests {
             ],
         );
         let mut buf = Cursor::new(Vec::new());
-        write_archive(&mut buf, &archive).unwrap();
+        write_dump(&mut buf, &dump).unwrap();
         buf.into_inner()
     }
 
@@ -1376,7 +1372,7 @@ mod tests {
         let bytes = make_data_archive(make_test_header(), data_content);
 
         let mut cursor = Cursor::new(bytes);
-        let parsed = read_archive(&mut cursor).unwrap();
+        let parsed = read_dump(&mut cursor).unwrap();
 
         assert_eq!(parsed.toc.entries.len(), 1);
         assert_eq!(parsed.toc.entries[0].data_state, OffsetState::Set);
