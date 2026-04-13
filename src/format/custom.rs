@@ -61,7 +61,7 @@ pub fn read_dump<R: Read + Seek>(r: &mut R) -> Result<Dump> {
 /// }
 /// ```
 pub struct CustomDataLoader<R: Read + Seek> {
-    reader: R,
+    pub reader: R,
     pub toc: TableOfContents,
 }
 
