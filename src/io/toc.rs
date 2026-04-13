@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
 use crate::{
@@ -220,25 +220,25 @@ fn read_toc_entry<R: Read>(r: &mut R, toc: &TableOfContents) -> Result<Entry> {
     })
 }
 
-pub fn write_toc<W: std::io::Write + std::io::Seek>(
-    w: &mut W,
-    toc: &TableOfContents,
-) -> Result<Vec<u64>> {
+/// Write the TOC header and all entries, returning the file positions of each entry's offset field for later fixup after writing data blocks.
+pub fn write_toc<W: Write>(w: &mut W, toc: &TableOfContents) -> Result<Vec<u64>> {
     let int_size = toc.int_size;
+    let mut bytes_written = 0u64;
     w.write_all(MAGIC)?;
-    write_byte(w, toc.version.major)?;
-    write_byte(w, toc.version.minor)?;
-    write_byte(w, toc.version.rev)?;
-    write_byte(w, int_size)?;
+    bytes_written += MAGIC.len() as u64;
+    bytes_written += write_byte(w, toc.version.major)? as u64;
+    bytes_written += write_byte(w, toc.version.minor)? as u64;
+    bytes_written += write_byte(w, toc.version.rev)? as u64;
+    bytes_written += write_byte(w, int_size)? as u64;
 
     if toc.version >= ArchiveVersion::new(1, 7, 0) {
-        write_byte(w, toc.off_size)?;
+        bytes_written += write_byte(w, toc.off_size)? as u64;
     }
 
-    write_byte(w, toc.format as u8)?;
+    bytes_written += write_byte(w, toc.format as u8)? as u64;
 
     if toc.version >= ArchiveVersion::new(1, 15, 0) {
-        write_byte(w, toc.compression as u8)?;
+        bytes_written += write_byte(w, toc.compression as u8)? as u64;
     } else {
         // Pre-1.15: only none and gzip are valid; write compression level
         let level = match toc.compression {
@@ -248,100 +248,101 @@ pub fn write_toc<W: std::io::Write + std::io::Seek>(
                 return Err(Error::UnsupportedCompression(other as u8));
             }
         };
-        write_int(w, level, int_size)?;
+        bytes_written += write_int(w, level, int_size)? as u64;
     }
 
-    write_timestamp(w, &toc.timestamp, int_size)?;
-    write_string(w, Some(&toc.dbname), int_size)?;
-    write_string(w, Some(&toc.server_version), int_size)?;
-    write_string(w, Some(&toc.dump_version), int_size)?;
+    bytes_written += write_timestamp(w, &toc.timestamp, int_size)? as u64;
+    bytes_written += write_string(w, Some(&toc.dbname), int_size)? as u64;
+    bytes_written += write_string(w, Some(&toc.server_version), int_size)? as u64;
+    bytes_written += write_string(w, Some(&toc.dump_version), int_size)? as u64;
 
     // Write entry count
-    write_int(w, toc.entries.len() as i32, int_size)?;
+    bytes_written += write_int(w, toc.entries.len() as i32, int_size)? as u64;
 
     // Record the file positions of each entry's offset field for later fixup after writing data blocks
     let mut offset_positions = Vec::with_capacity(toc.entries.len());
     for entry in &toc.entries {
-        offset_positions.push(write_toc_entry(w, entry, toc)?);
+        let (offset_pos, entry_bytes) = write_toc_entry(w, entry, toc, bytes_written)?;
+        offset_positions.push(offset_pos);
+        bytes_written += entry_bytes;
     }
 
     Ok(offset_positions)
 }
 
-/// Write an entry, returning the file position of the offset field (for later fixup).
-fn write_toc_entry<W: std::io::Write + Seek>(
+/// Write an entry, returning the file position of the offset field (for later fixup), and the total bytes written for this entry.
+fn write_toc_entry<W: Write>(
     w: &mut W,
     entry: &Entry,
     toc: &TableOfContents,
-) -> Result<u64> {
+    start_pos: u64,
+) -> Result<(u64, u64)> {
     let int_size = toc.int_size;
     let off_size = toc.off_size;
     let version = toc.version;
+    let mut bytes_written = 0u64;
 
-    write_int(w, entry.dump_id, int_size)?;
-    write_int(w, if entry.had_dumper { 1 } else { 0 }, int_size)?;
-    write_string(w, Some(&entry.table_oid), int_size)?;
-    write_string(w, Some(&entry.oid), int_size)?;
-    write_string(w, entry.tag.as_deref(), int_size)?;
-    write_string(w, Some(entry.desc.as_str()), int_size)?;
+    bytes_written += write_int(w, entry.dump_id, int_size)? as u64;
+    bytes_written += write_int(w, if entry.had_dumper { 1 } else { 0 }, int_size)? as u64;
+    bytes_written += write_string(w, Some(&entry.table_oid), int_size)? as u64;
+    bytes_written += write_string(w, Some(&entry.oid), int_size)? as u64;
+    bytes_written += write_string(w, entry.tag.as_deref(), int_size)? as u64;
+    bytes_written += write_string(w, Some(entry.desc.as_str()), int_size)? as u64;
 
     if version >= ArchiveVersion::new(1, 11, 0) {
-        write_int(w, entry.section.to_int(), int_size)?;
+        bytes_written += write_int(w, entry.section.to_int(), int_size)? as u64;
     }
 
-    write_string(w, entry.defn.as_deref(), int_size)?;
-    write_string(w, entry.drop_stmt.as_deref(), int_size)?;
+    bytes_written += write_string(w, entry.defn.as_deref(), int_size)? as u64;
+    bytes_written += write_string(w, entry.drop_stmt.as_deref(), int_size)? as u64;
 
     if version >= ArchiveVersion::new(1, 3, 0) {
-        write_string(w, entry.copy_stmt.as_deref(), int_size)?;
+        bytes_written += write_string(w, entry.copy_stmt.as_deref(), int_size)? as u64;
     }
 
     if version >= ArchiveVersion::new(1, 6, 0) {
-        write_string(w, entry.namespace.as_deref(), int_size)?;
+        bytes_written += write_string(w, entry.namespace.as_deref(), int_size)? as u64;
     }
 
     if version >= ArchiveVersion::new(1, 10, 0) {
-        write_string(w, entry.tablespace.as_deref(), int_size)?;
+        bytes_written += write_string(w, entry.tablespace.as_deref(), int_size)? as u64;
     }
 
     if version >= ArchiveVersion::new(1, 14, 0) {
-        write_string(w, entry.tableam.as_deref(), int_size)?;
+        bytes_written += write_string(w, entry.tableam.as_deref(), int_size)? as u64;
     }
 
     if version >= ArchiveVersion::new(1, 16, 0) {
         let rk = entry.relkind.map(|c| c as i32).unwrap_or(0);
-        write_int(w, rk, int_size)?;
+        bytes_written += write_int(w, rk, int_size)? as u64;
     }
 
-    write_string(w, entry.owner.as_deref(), int_size)?;
+    bytes_written += write_string(w, entry.owner.as_deref(), int_size)? as u64;
 
     if version >= ArchiveVersion::new(1, 9, 0) {
-        write_string(
+        bytes_written += write_string(
             w,
             Some(if entry.with_oids { "true" } else { "false" }),
             int_size,
-        )?;
+        )? as u64;
     }
 
     if version >= ArchiveVersion::new(1, 5, 0) {
         for dep in &entry.dependencies {
-            write_string(w, Some(&dep.to_string()), int_size)?;
+            bytes_written += write_string(w, Some(&dep.to_string()), int_size)? as u64;
         }
         // Terminate with NULL
-        write_string(w, None, int_size)?;
+        bytes_written += write_string(w, None, int_size)? as u64;
     }
 
-    // Record position of offset for later fixup
-    let offset_pos = w.stream_position()?;
-    write_offset(w, entry.data_state, entry.offset, off_size)?;
+    let offset_pos = start_pos + bytes_written;
+    bytes_written += write_offset(w, entry.data_state, entry.offset, off_size)? as u64;
 
-    Ok(offset_pos)
+    Ok((offset_pos, bytes_written))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Seek, SeekFrom};
-
     use crate::{
         ArchiveVersion, CompressionAlgorithm, Entry, Format, ObjectType, OffsetState, Section,
         TableOfContents, Timestamp,
@@ -379,11 +380,11 @@ mod tests {
     #[test]
     fn test_header_round_trip() {
         let header = make_test_toc();
-        let mut buf = Cursor::new(Vec::new());
+        let mut buf = Vec::new();
         write_toc(&mut buf, &header).unwrap();
 
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        let parsed = read_toc(&mut buf).unwrap();
+        let mut reader = &buf[..];
+        let parsed = read_toc(&mut reader).unwrap();
         assert_eq!(parsed, header);
     }
 
@@ -413,11 +414,11 @@ mod tests {
             filename: None,
         });
 
-        let mut buf = Cursor::new(Vec::new());
+        let mut buf = Vec::new();
         write_toc(&mut buf, &toc).unwrap();
 
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        let parsed = read_toc(&mut buf).unwrap();
+        let mut reader = &buf[..];
+        let parsed = read_toc(&mut reader).unwrap();
 
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0], toc.entries[0]);
