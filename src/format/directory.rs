@@ -13,7 +13,7 @@ use crate::io::primitives::{
 };
 use crate::toc::TableOfContents;
 use crate::types::{
-    Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section, Timestamp,
+    Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
 };
 use crate::version::{ArchiveVersion, MAX_VERSION, MIN_VERSION};
 use flate2::read::GzDecoder;
@@ -47,36 +47,10 @@ pub fn read_metadata(dir: &Path) -> Result<TableOfContents> {
 pub(crate) fn read_toc_data(toc_data: &[u8], format: Format) -> Result<TableOfContents> {
     let mut r = Cursor::new(toc_data);
 
-    let header = read_header(&mut r)?;
-    let int_size = header.int_size;
+    let toc = read_toc(&mut r)?;
 
-    let timestamp = read_timestamp(&mut r, int_size)?;
-    let dbname = read_string(&mut r, int_size)?.unwrap_or_default();
-    let server_version = read_string(&mut r, int_size)?.unwrap_or_default();
-    let dump_version = read_string(&mut r, int_size)?.unwrap_or_default();
-
-    let toc_count = read_int(&mut r, int_size)?;
-    if toc_count < 0 {
-        return Err(Error::DataIntegrity(format!(
-            "invalid TOC entry count: {toc_count}"
-        )));
-    }
-
-    let mut entries = Vec::with_capacity(toc_count as usize);
-    for _ in 0..toc_count {
-        entries.push(read_entry(&mut r, &header)?);
-    }
-
-    Ok(TableOfContents {
-        // toc.dat stores archTar(3), override to caller format.
-        format,
-        timestamp,
-        dbname,
-        server_version,
-        dump_version,
-        entries,
-        ..header
-    })
+    // toc.dat stores archTar(3), override to caller format.
+    Ok(TableOfContents { format, ..toc })
 }
 
 /// Write a [Dump] to the given path in directory format.
@@ -92,23 +66,7 @@ pub fn write_dump(dir: &Path, dump: &Dump) -> Result<()> {
         ..dump.toc.clone()
     };
 
-    write_header(&mut toc_file, &toc)?;
-    write_timestamp(&mut toc_file, &dump.toc.timestamp, toc.int_size)?;
-    write_string(&mut toc_file, Some(&dump.toc.dbname), toc.int_size)?;
-    write_string(&mut toc_file, Some(&dump.toc.server_version), toc.int_size)?;
-    write_string(&mut toc_file, Some(&dump.toc.dump_version), toc.int_size)?;
-
-    let entry_count: i32 = dump
-        .toc
-        .entries
-        .len()
-        .try_into()
-        .map_err(|_| Error::DataIntegrity("too many entries for i32".to_string()))?;
-    write_int(&mut toc_file, entry_count, toc.int_size)?;
-
-    for entry in &dump.toc.entries {
-        write_entry(&mut toc_file, entry, &toc)?;
-    }
+    write_toc(&mut toc_file, &toc)?;
 
     // Write data files
     for entry in &dump.toc.entries {
@@ -129,9 +87,9 @@ pub fn write_dump(dir: &Path, dump: &Dump) -> Result<()> {
     Ok(())
 }
 
-// -- Header reading/writing --
+// -- Table of Contents reading/writing --
 
-fn read_header<R: Read>(r: &mut R) -> Result<TableOfContents> {
+fn read_toc<R: Read>(r: &mut R) -> Result<TableOfContents> {
     let mut magic = [0u8; 5];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -174,9 +132,10 @@ fn read_header<R: Read>(r: &mut R) -> Result<TableOfContents> {
     };
 
     let format_byte = read_byte(r)?;
-    // Directory format toc.dat stores archTar(3); accept both tar and directory
+    // Directory format toc.dat stores archTar(3); accept both tar and directory,
+    // but override to Directory in the returned header since we're reading as directory
     let format = match format_byte {
-        3 => Format::Tar, // will be overridden to Directory by caller
+        3 => Format::Directory,
         5 => Format::Directory,
         _ => Format::from_byte(format_byte).ok_or(Error::UnsupportedFormat(format_byte))?,
     };
@@ -194,52 +153,77 @@ fn read_header<R: Read>(r: &mut R) -> Result<TableOfContents> {
         }
     };
 
-    Ok(TableOfContents {
+    let timestamp = read_timestamp(r, int_size)?;
+    let dbname = read_string( r, int_size)?.unwrap_or_default();
+    let server_version = read_string( r, int_size)?.unwrap_or_default();
+    let dump_version = read_string( r, int_size)?.unwrap_or_default();
+
+    let toc_count = read_int( r, int_size)?;
+    if toc_count < 0 {
+        return Err(Error::DataIntegrity(format!(
+            "invalid TOC entry count: {toc_count}"
+        )));
+    }
+
+    
+    let mut toc = TableOfContents {
         version,
         int_size,
         off_size,
         format,
         compression,
-        timestamp: Timestamp {
-            second: 0,
-            minute: 0,
-            hour: 0,
-            day: 0,
-            month: 0,
-            year: 0,
-            is_dst: 0,
-        },
-        dbname: String::new(),
-        server_version: String::new(),
-        dump_version: String::new(),
-        entries: Vec::new(),
-    })
+        timestamp,
+        dbname,
+        server_version,
+        dump_version,
+        entries: Vec::with_capacity(toc_count as usize)
+    };
+    for _ in 0..toc_count {
+        toc.entries.push(read_toc_entry(r, &toc)?);
+    }
+    Ok(toc)
 }
 
-fn write_header<W: Write>(w: &mut W, header: &TableOfContents) -> Result<()> {
+fn write_toc<W: Write>(w: &mut W, toc: &TableOfContents) -> Result<()> {
     w.write_all(MAGIC)?;
-    write_byte(w, header.version.major)?;
-    write_byte(w, header.version.minor)?;
-    write_byte(w, header.version.rev)?;
-    write_byte(w, header.int_size)?;
+    write_byte(w, toc.version.major)?;
+    write_byte(w, toc.version.minor)?;
+    write_byte(w, toc.version.rev)?;
+    write_byte(w, toc.int_size)?;
 
-    if header.version >= ArchiveVersion::new(1, 7, 0) {
-        write_byte(w, header.off_size)?;
+    if toc.version >= ArchiveVersion::new(1, 7, 0) {
+        write_byte(w, toc.off_size)?;
     }
 
-    write_byte(w, header.format as u8)?;
+    write_byte(w, toc.format as u8)?;
 
-    if header.version >= ArchiveVersion::new(1, 15, 0) {
-        write_byte(w, header.compression as u8)?;
+    if toc.version >= ArchiveVersion::new(1, 15, 0) {
+        write_byte(w, toc.compression as u8)?;
     } else {
-        let level = match header.compression {
+        let level = match toc.compression {
             CompressionAlgorithm::None => 0,
             CompressionAlgorithm::Gzip => 6,
             other => {
                 return Err(Error::UnsupportedCompression(other as u8));
             }
         };
-        write_int(w, level, header.int_size)?;
+        write_int(w, level, toc.int_size)?;
+    }
+    
+    write_timestamp(w, &toc.timestamp, toc.int_size)?;
+    write_string(w, Some(&toc.dbname), toc.int_size)?;
+    write_string(w, Some(&toc.server_version), toc.int_size)?;
+    write_string(w, Some(&toc.dump_version), toc.int_size)?;
+
+    let entry_count: i32 = toc
+        .entries
+        .len()
+        .try_into()
+        .map_err(|_| Error::DataIntegrity("too many entries for i32".to_string()))?;
+    write_int(w, entry_count, toc.int_size)?;
+
+    for entry in &toc.entries {
+        write_toc_entry(w, entry, toc)?;
     }
 
     Ok(())
@@ -247,7 +231,7 @@ fn write_header<W: Write>(w: &mut W, header: &TableOfContents) -> Result<()> {
 
 // -- Entry reading/writing --
 
-fn read_entry<R: Read>(r: &mut R, header: &TableOfContents) -> Result<Entry> {
+fn read_toc_entry<R: Read>(r: &mut R, header: &TableOfContents) -> Result<Entry> {
     let int_size = header.int_size;
     let version = header.version;
 
@@ -362,7 +346,7 @@ fn read_entry<R: Read>(r: &mut R, header: &TableOfContents) -> Result<Entry> {
     })
 }
 
-fn write_entry<W: Write>(w: &mut W, entry: &Entry, toc: &TableOfContents) -> Result<()> {
+fn write_toc_entry<W: Write>(w: &mut W, entry: &Entry, toc: &TableOfContents) -> Result<()> {
     let int_size = toc.int_size;
     let version = toc.version;
 
@@ -616,9 +600,9 @@ fn write_blob_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OffsetState;
+    use crate::{Timestamp, types::OffsetState};
 
-    fn make_test_header() -> TableOfContents {
+    fn make_test_toc() -> TableOfContents {
         TableOfContents {
             version: ArchiveVersion::new(1, 14, 0),
             int_size: 4,
@@ -626,9 +610,9 @@ mod tests {
             format: Format::Directory,
             compression: CompressionAlgorithm::None,
             timestamp: Timestamp {
-                second: 0,
-                minute: 0,
-                hour: 0,
+                second: 1,
+                minute: 2,
+                hour: 3,
                 day: 1,
                 month: 0,
                 year: 125,
@@ -667,7 +651,7 @@ mod tests {
                     offset: 0,
                     filename: None,
                 }],
-                ..make_test_header()
+                ..make_test_toc()
             },
             data: HashMap::new(),
             blobs: HashMap::new(),
@@ -677,7 +661,7 @@ mod tests {
         write_dump(tmp.path(), &dump).unwrap();
 
         let parsed = read_dump(tmp.path()).unwrap();
-        assert_eq!(parsed.toc.dbname, "testdb");
+        assert_eq!(parsed.toc, dump.toc);
         assert_eq!(parsed.toc.entries.len(), 1);
         assert_eq!(parsed.toc.entries[0].desc, ObjectType::Encoding);
     }
@@ -708,7 +692,7 @@ mod tests {
                     offset: 0,
                     filename: None,
                 }],
-                ..make_test_header()
+                ..make_test_toc()
             },
             data: HashMap::new(),
             blobs: HashMap::new(),
@@ -753,7 +737,7 @@ mod tests {
                     offset: 0,
                     filename: Some("1.dat".to_string()),
                 }],
-                ..make_test_header()
+                ..make_test_toc()
             },
             data: HashMap::new(),
             blobs: HashMap::new(),
@@ -798,7 +782,7 @@ mod tests {
                     offset: 0,
                     filename: Some("blobs_1.toc".to_string()),
                 }],
-                ..make_test_header()
+                ..make_test_toc()
             },
             data: HashMap::new(),
             blobs: HashMap::new(),

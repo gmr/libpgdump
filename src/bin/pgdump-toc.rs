@@ -5,7 +5,7 @@ use std::path::Path;
 use libpgdump::dump::detect_file_format;
 use libpgdump::error::Result;
 use libpgdump::format::directory;
-use libpgdump::io::toc::read_toc;
+use libpgdump::format::custom_toc::read_toc;
 use libpgdump::{Format, OffsetState, TableOfContents};
 
 /// A simple utility to print archive header and TOC entries without loading data blocks.
