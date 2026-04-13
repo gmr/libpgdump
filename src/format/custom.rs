@@ -8,7 +8,6 @@ use crate::io::entry_data::{
     EntryReader, read_blob_data, read_block_header, read_compressed_data, write_blob_block,
     write_data_block,
 };
-use crate::io::primitives::write_offset;
 use crate::io::toc::{read_toc, write_toc};
 use crate::toc::TableOfContents;
 use crate::types::{BlockType, OffsetState};
@@ -227,36 +226,42 @@ fn read_data_blocks<R: Read + Seek>(
 }
 
 /// Write a [Dump] to a writer in custom format (as in using `-Fc` with pg_dump).
-pub fn write_dump<W: std::io::Write + Seek>(w: &mut W, dump: &Dump) -> Result<()> {
-    let offset_positions = write_toc(w, &dump.toc)?;
+pub fn write_dump<W: std::io::Write>(w: &mut W, dump: &Dump) -> Result<usize> {
+    let mut toc = dump.toc.clone();
 
-    // Write compression for pre-1.15 (handled inside write_header)
+    let mut toc_probe = Vec::new();
+    write_toc(&mut toc_probe, &toc)?;
+    let mut next_offset = toc_probe.len() as u64;
 
-    // Write data blocks and record actual offsets
-    let mut actual_offsets: HashMap<i32, u64> = HashMap::new();
-    for entry in &dump.toc.entries {
-        // Check for blob data first, then regular data
+    for entry in &mut toc.entries {
         if let Some(blobs) = dump.blobs.get(&entry.dump_id) {
-            let pos = w.stream_position()?;
-            actual_offsets.insert(entry.dump_id, pos);
-            write_blob_block(w, &dump.toc, entry.dump_id, blobs)?;
+            let block_size =
+                write_blob_block(&mut std::io::sink(), &dump.toc, entry.dump_id, blobs)?;
+            entry.data_state = OffsetState::Set;
+            entry.offset = next_offset;
+            next_offset += block_size as u64;
         } else if let Some(data) = dump.data.get(&entry.dump_id) {
-            let pos = w.stream_position()?;
-            actual_offsets.insert(entry.dump_id, pos);
-            write_data_block(w, &dump.toc, entry.dump_id, data)?;
+            let block_size =
+                write_data_block(&mut std::io::sink(), &dump.toc, entry.dump_id, data)?;
+            entry.data_state = OffsetState::Set;
+            entry.offset = next_offset;
+            next_offset += block_size as u64;
         }
     }
 
-    // Second pass: go back and fix the offsets
-    for (i, entry) in dump.toc.entries.iter().enumerate() {
-        let offset_file_pos = offset_positions[i];
-        if let Some(&actual_offset) = actual_offsets.get(&entry.dump_id) {
-            w.seek(SeekFrom::Start(offset_file_pos))?;
-            write_offset(w, OffsetState::Set, actual_offset, dump.toc.off_size)?;
+    write_toc(w, &toc)?;
+    let mut written = toc_probe.len();
+
+    for entry in &toc.entries {
+        // Keep blob precedence to match existing behavior when both maps contain a dump_id.
+        if let Some(blobs) = dump.blobs.get(&entry.dump_id) {
+            written += write_blob_block(w, &toc, entry.dump_id, blobs)?;
+        } else if let Some(data) = dump.data.get(&entry.dump_id) {
+            written += write_data_block(w, &toc, entry.dump_id, data)?;
         }
     }
 
-    Ok(())
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -326,20 +331,18 @@ mod tests {
             blobs: HashMap::new(),
         };
 
-        let mut buf = Cursor::new(Vec::new());
-        write_dump(&mut buf, &dump).unwrap();
+        let mut bytes = Vec::new();
+        let written = write_dump(&mut bytes, &dump).unwrap();
+        assert_eq!(written, bytes.len());
 
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        let parsed = read_dump(&mut buf).unwrap();
+        let mut reader = Cursor::new(bytes);
+        let parsed = read_dump(&mut reader).unwrap();
 
-        assert_eq!(parsed.toc.dbname, "testdb");
-        assert_eq!(parsed.toc.server_version, "17.0");
-        assert_eq!(parsed.toc.dump_version, "pg_dump (PostgreSQL) 17.0");
-        assert_eq!(parsed.toc.entries.len(), 1);
-        assert_eq!(parsed.toc.entries[0].desc, ObjectType::Encoding);
+        assert_eq!(parsed.toc, dump.toc);
+        assert_eq!(parsed.data.len(), 0);
+        assert_eq!(parsed.blobs.len(), 0);
         assert_eq!(
-            parsed.toc.entries[0].defn.as_deref(),
-            Some("SET client_encoding = 'UTF8';\n")
+            parsed.toc.entries[0], dump.toc.entries[0]
         );
     }
 
@@ -404,13 +407,15 @@ mod tests {
         };
         dump.data.insert(2, data_content.to_vec());
 
-        let mut buf = Cursor::new(Vec::new());
-        write_dump(&mut buf, &dump).unwrap();
+        let mut buf = Vec::new();
+        let n_bytes_written = write_dump(&mut buf, &dump).unwrap();
+        assert_eq!(n_bytes_written, buf.len());
 
         // Open with CustomReader — should parse header + TOC only
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        let reader = CustomReader::open(buf).unwrap();
+        let buf_cursor = Cursor::new(buf);
+        let reader = CustomReader::open(buf_cursor).unwrap();
 
+        // assert_eq!(reader.toc, dump.toc);
         assert_eq!(reader.timestamp(), &make_test_timestamp());
         assert_eq!(reader.dbname(), "testdb");
         assert_eq!(reader.server_version(), "17.0");
@@ -563,9 +568,10 @@ mod tests {
                 },
             ],
         );
-        let mut buf = Cursor::new(Vec::new());
-        write_dump(&mut buf, &dump).unwrap();
-        buf.into_inner()
+        let mut buf = Vec::new();
+        let n_bytes_written = write_dump(&mut buf, &dump).unwrap();
+        assert_eq!(n_bytes_written, buf.len());
+        buf
     }
 
     #[test]

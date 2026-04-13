@@ -214,20 +214,21 @@ pub(crate) fn write_data_block<W: std::io::Write>(
     toc: &TableOfContents,
     dump_id: i32,
     data: &[u8],
-) -> Result<()> {
-    write_byte(w, BlockType::Data as u8)?;
-    write_int(w, dump_id, toc.int_size)?;
+) -> Result<usize> {
+    let mut written = 0;
+    written += write_byte(w, BlockType::Data as u8)?;
+    written += write_int(w, dump_id, toc.int_size)?;
 
     if data.is_empty() {
-        write_int(w, 0, toc.int_size)?;
-        return Ok(());
+        written += write_int(w, 0, toc.int_size)?;
+        return Ok(written);
     }
 
-    write_compressed_chunks(w, toc, data)?;
+    written += write_compressed_chunks(w, toc, data)?;
 
     // Write terminator (zero-length chunk)
-    write_int(w, 0, toc.int_size)?;
-    Ok(())
+    written += write_int(w, 0, toc.int_size)?;
+    Ok(written)
 }
 
 /// Write a BLK_BLOBS block from individual blob entries.
@@ -238,20 +239,21 @@ pub(crate) fn write_blob_block<W: std::io::Write>(
     toc: &TableOfContents,
     dump_id: i32,
     blobs: &[Blob],
-) -> Result<()> {
-    write_byte(w, BlockType::Blobs as u8)?;
-    write_int(w, dump_id, toc.int_size)?;
+) -> Result<usize> {
+    let mut written = 0;
+    written += write_byte(w, BlockType::Blobs as u8)?;
+    written += write_int(w, dump_id, toc.int_size)?;
 
     for blob in blobs {
-        write_int(w, blob.oid, toc.int_size)?;
-        write_compressed_chunks(w, toc, &blob.data)?;
+        written += write_int(w, blob.oid, toc.int_size)?;
+        written += write_compressed_chunks(w, toc, &blob.data)?;
         // Terminator for this blob's data
-        write_int(w, 0, toc.int_size)?;
+        written += write_int(w, 0, toc.int_size)?;
     }
 
     // Terminating zero OID
-    write_int(w, 0, toc.int_size)?;
-    Ok(())
+    written += write_int(w, 0, toc.int_size)?;
+    Ok(written)
 }
 
 /// Write data as compressed (or uncompressed) chunks.
@@ -259,16 +261,19 @@ fn write_compressed_chunks<W: std::io::Write>(
     w: &mut W,
     toc: &TableOfContents,
     data: &[u8],
-) -> Result<()> {
+) -> Result<usize> {
     if data.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+
+    let mut written = 0;
 
     match toc.compression {
         CompressionAlgorithm::None => {
             for chunk in data.chunks(4096) {
-                write_int(w, chunk.len() as i32, toc.int_size)?;
+                written += write_int(w, chunk.len() as i32, toc.int_size)?;
                 w.write_all(chunk)?;
+                written += chunk.len();
             }
         }
         _ => {
@@ -278,12 +283,13 @@ fn write_compressed_chunks<W: std::io::Write>(
                 comp.write_all(data)?;
                 comp.flush()?;
             }
-            write_int(w, compressed.len() as i32, toc.int_size)?;
+            written += write_int(w, compressed.len() as i32, toc.int_size)?;
             w.write_all(&compressed)?;
+            written += compressed.len();
         }
     }
 
-    Ok(())
+    Ok(written)
 }
 
 #[cfg(test)]
