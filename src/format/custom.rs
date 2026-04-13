@@ -416,7 +416,7 @@ mod tests {
         let buf_cursor = Cursor::new(buf);
         let reader = CustomReader::open(buf_cursor).unwrap();
 
-        // assert_eq!(reader.toc, dump.toc);
+        // can't compare entire TOC due to offset differences, but can check key fields and entries
         assert_eq!(reader.timestamp(), &make_test_timestamp());
         assert_eq!(reader.dbname(), "testdb");
         assert_eq!(reader.server_version(), "17.0");
