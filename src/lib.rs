@@ -14,7 +14,7 @@ use std::path::Path;
 pub use dump::Dump;
 pub use entry::Entry;
 pub use error::{Error, Result};
-pub use format::custom::{CustomDataReader, EntryData};
+pub use format::custom::{CustomDataLoader, EntryData};
 pub use toc::TableOfContents;
 pub use types::{
     Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section, Timestamp,

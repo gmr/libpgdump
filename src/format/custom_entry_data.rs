@@ -35,7 +35,7 @@ pub(crate) fn read_blob_data<R: Read>(r: &mut R, toc: &TableOfContents) -> Resul
         if oid == 0 {
             break;
         }
-        let data = read_compressed_data(r, toc)?;
+        let data = read_table_data(r, toc)?;
         blobs.push(Blob { oid, data });
     }
 
@@ -46,8 +46,8 @@ pub(crate) fn read_blob_data<R: Read>(r: &mut R, toc: &TableOfContents) -> Resul
 ///
 /// Each chunk: length (int), then that many bytes of compressed data.
 /// A length of 0 terminates the sequence.
-pub(crate) fn read_compressed_data<R: Read>(r: &mut R, toc: &TableOfContents) -> Result<Vec<u8>> {
-    let reader = EntryReader::new(r, toc.int_size, toc.compression)?;
+pub(crate) fn read_table_data<R: Read>(r: &mut R, toc: &TableOfContents) -> Result<Vec<u8>> {
+    let reader = TableDataReader::new(r, toc.int_size, toc.compression)?;
     let mut decompressed_data = Vec::new();
     let mut buf_reader = std::io::BufReader::new(reader);
     buf_reader.read_to_end(&mut decompressed_data)?;
@@ -56,32 +56,32 @@ pub(crate) fn read_compressed_data<R: Read>(r: &mut R, toc: &TableOfContents) ->
 
 /// Either a [`RawEntryReader`] for uncompressed TABLE DATA or a [`CompressedEntryReader`] for compressed data.
 #[derive(Debug)]
-pub enum EntryReader<'a, R: Read> {
+pub enum TableDataReader<'a, R: Read> {
     /// A streaming reader for uncompressed TABLE DATA.
-    Raw(RawEntryReader<'a, R>),
+    Raw(RawTableDataReader<'a, R>),
     /// A streaming reader for compressed data
-    Compressed(CompressedEntryReader<'a, R>),
+    Compressed(CompressedTableDataReader<'a, R>),
 }
 
-impl<'a, R: Read> EntryReader<'a, R> {
+impl<'a, R: Read> TableDataReader<'a, R> {
     pub fn new(reader: &'a mut R, int_size: u8, compression: CompressionAlgorithm) -> Result<Self> {
-        let raw_reader = RawEntryReader::new(reader, int_size);
+        let raw_reader = RawTableDataReader::new(reader, int_size);
         if compression == CompressionAlgorithm::None {
-            return Ok(EntryReader::Raw(raw_reader));
+            return Ok(TableDataReader::Raw(raw_reader));
         }
 
         let decompressor = compress::decompressor(compression, raw_reader)?;
-        Ok(EntryReader::Compressed(CompressedEntryReader::new(
+        Ok(TableDataReader::Compressed(CompressedTableDataReader::new(
             decompressor,
         )))
     }
 }
 
-impl<R: Read> Read for EntryReader<'_, R> {
+impl<R: Read> Read for TableDataReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            EntryReader::Raw(reader) => reader.read(buf),
-            EntryReader::Compressed(reader) => reader.read(buf),
+            TableDataReader::Raw(reader) => reader.read(buf),
+            TableDataReader::Compressed(reader) => reader.read(buf),
         }
     }
 }
@@ -91,18 +91,18 @@ impl<R: Read> Read for EntryReader<'_, R> {
 /// This typically wraps a RawEntryReader, but any Read will work.
 ///
 /// The result from read() is the next chunk of uncompressed data.
-pub struct CompressedEntryReader<'a, R: Read> {
+pub struct CompressedTableDataReader<'a, R: Read> {
     decompressor: Box<dyn Read + 'a>,
     _marker: std::marker::PhantomData<R>,
 }
 
-impl<R: Read> std::fmt::Debug for CompressedEntryReader<'_, R> {
+impl<R: Read> std::fmt::Debug for CompressedTableDataReader<'_, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompressedEntryReader").finish()
+        f.debug_struct("CompressedTableDataReader").finish()
     }
 }
 
-impl<'a, R: Read> CompressedEntryReader<'a, R> {
+impl<'a, R: Read> CompressedTableDataReader<'a, R> {
     fn new(decompressor: Box<dyn Read + 'a>) -> Self {
         Self {
             decompressor,
@@ -111,13 +111,13 @@ impl<'a, R: Read> CompressedEntryReader<'a, R> {
     }
 }
 
-impl<R: Read> Read for CompressedEntryReader<'_, R> {
+impl<R: Read> Read for CompressedTableDataReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.decompressor.read(buf)
     }
 }
 
-/// A streaming reader over a single entry's raw data.
+/// A streaming reader over a table data entry's raw data.
 ///
 /// If the entry is compressed, you will need to wrap it with a decompressor.
 ///
@@ -127,25 +127,25 @@ impl<R: Read> Read for CompressedEntryReader<'_, R> {
 /// The data format is a sequence of chunks:
 /// Each chunk: length (int), then that many bytes of raw (either compressed or uncompressed) data.
 /// A length of 0 terminates the sequence.
-pub struct RawEntryReader<'a, R: Read> {
+pub struct RawTableDataReader<'a, R: Read> {
     reader: &'a mut R,
     int_size: u8,
     done: bool,
     chunk_remaining: usize,
 }
 
-impl<R: Read> std::fmt::Debug for RawEntryReader<'_, R> {
+impl<R: Read> std::fmt::Debug for RawTableDataReader<'_, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntryReader")
+        f.debug_struct("RawTableDataReader")
             .field("done", &self.done)
             .field("chunk_remaining", &self.chunk_remaining)
             .finish()
     }
 }
 
-impl<R: Read> RawEntryReader<'_, R> {
-    fn new(reader: &mut R, int_size: u8) -> RawEntryReader<'_, R> {
-        RawEntryReader {
+impl<R: Read> RawTableDataReader<'_, R> {
+    fn new(reader: &mut R, int_size: u8) -> RawTableDataReader<'_, R> {
+        RawTableDataReader {
             reader,
             int_size,
             done: false,
@@ -189,7 +189,7 @@ impl<R: Read> RawEntryReader<'_, R> {
     }
 }
 
-impl<R: Read> Read for RawEntryReader<'_, R> {
+impl<R: Read> Read for RawTableDataReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -299,7 +299,7 @@ mod tests {
     use crate::{ArchiveVersion, CompressionAlgorithm, Format, TableOfContents, Timestamp};
 
     use super::{
-        EntryReader, read_blob_data, read_block_header, read_compressed_data, write_blob_block,
+        TableDataReader, read_blob_data, read_block_header, read_table_data, write_blob_block,
         write_data_block,
     };
 
@@ -342,7 +342,7 @@ mod tests {
         let block_type = read_block_header(&mut buf, toc.int_size, 1).unwrap();
         assert_eq!(block_type as u8, crate::BlockType::Data as u8);
 
-        let parsed = read_compressed_data(&mut buf, &toc).unwrap();
+        let parsed = read_table_data(&mut buf, &toc).unwrap();
         assert_eq!(parsed, data_content);
     }
 
@@ -358,7 +358,7 @@ mod tests {
         let block_type = read_block_header(&mut buf, toc.int_size, 1).unwrap();
         assert_eq!(block_type as u8, crate::BlockType::Data as u8);
 
-        let parsed = read_compressed_data(&mut buf, &toc).unwrap();
+        let parsed = read_table_data(&mut buf, &toc).unwrap();
         assert_eq!(parsed, data_content);
     }
 
@@ -431,7 +431,7 @@ mod tests {
         buf.set_position(0);
         read_block_header(&mut buf, toc.int_size, 1).unwrap();
 
-        let mut reader = EntryReader::new(&mut buf, toc.int_size, toc.compression).unwrap();
+        let mut reader = TableDataReader::new(&mut buf, toc.int_size, toc.compression).unwrap();
         let mut streamed = Vec::new();
         reader.read_to_end(&mut streamed).unwrap();
         assert_eq!(streamed, data_content);
@@ -448,7 +448,7 @@ mod tests {
         buf.set_position(0);
         read_block_header(&mut buf, toc.int_size, 1).unwrap();
 
-        let mut reader = EntryReader::new(&mut buf, toc.int_size, toc.compression).unwrap();
+        let mut reader = TableDataReader::new(&mut buf, toc.int_size, toc.compression).unwrap();
         let mut streamed = Vec::new();
         reader.read_to_end(&mut streamed).unwrap();
         assert_eq!(streamed, data_content);
@@ -465,9 +465,9 @@ mod tests {
         buf.set_position(0);
         read_block_header(&mut buf, toc.int_size, 1).unwrap();
 
-        let mut entry_reader = EntryReader::new(&mut buf, toc.int_size, toc.compression).unwrap();
+        let mut entry_reader = TableDataReader::new(&mut buf, toc.int_size, toc.compression).unwrap();
         match &mut entry_reader {
-            EntryReader::Raw(raw) => {
+            TableDataReader::Raw(raw) => {
                 assert_eq!(raw.remaining_bytes_in_chunk().unwrap(), 4096);
 
                 let mut first = vec![0u8; raw.remaining_bytes_in_chunk().unwrap()];
@@ -482,7 +482,7 @@ mod tests {
 
                 assert_eq!(raw.remaining_bytes_in_chunk().unwrap(), 0);
             }
-            EntryReader::Compressed(_) => panic!("expected raw entry reader"),
+            TableDataReader::Compressed(_) => panic!("expected raw entry reader"),
         }
     }
 }

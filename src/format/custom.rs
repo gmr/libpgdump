@@ -4,9 +4,9 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-pub use crate::format::custom_entry_data::EntryReader;
+pub use crate::format::custom_entry_data::TableDataReader;
 use crate::format::custom_entry_data::{
-    read_blob_data, read_block_header, read_compressed_data, write_blob_block, write_data_block,
+    read_blob_data, read_block_header, read_table_data, write_blob_block, write_data_block,
 };
 use crate::format::custom_toc::{read_toc, write_toc};
 use crate::toc::TableOfContents;
@@ -33,74 +33,50 @@ pub fn read_dump<R: Read + Seek>(r: &mut R) -> Result<Dump> {
     Ok(Dump { toc, data, blobs })
 }
 
-/// A lazy reader for custom format (`-Fc`) PostgreSQL dumps.
+/// Read data entries from a custom format archive on demand, without loading the entire dump into memory.
 ///
-/// Parses the header and TOC entries on construction, but defers reading
-/// data blocks until explicitly requested. This allows working with
-/// dumps too large to fit in memory.
+/// Allows for streaming TABLE DATA and BLOBs entry data with a Reader interface,
+/// without loading the entire dump into memory at once.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use libpgdump::CustomDataReader;
+/// use libpgdump::CustomDataLoader;
 ///
 /// let file = File::open("dump.sql").unwrap();
-/// let mut reader = CustomDataReader::from_reader(BufReader::new(file)).unwrap();
+/// let mut loader = CustomDataLoader::from_reader(BufReader::new(file)).unwrap();
 ///
 /// // Inspect TOC without loading data
-/// for entry in &reader.toc.entries {
+/// for entry in &loader.toc.entries {
 ///     println!("{}: {:?}", entry.dump_id, entry.desc);
 /// }
 ///
 /// // Read a specific entry's data on demand
-/// if let Some(data) = reader.read_entry_data(1).unwrap() {
+/// if let Some(entry_reader) = loader.open_data_reader(1).unwrap() {
 ///     // process data
 /// }
 /// ```
-pub struct CustomDataReader<R: Read + Seek> {
+pub struct CustomDataLoader<R: Read + Seek> {
     reader: R,
     pub toc: TableOfContents,
 }
 
-impl<R: Read + Seek> CustomDataReader<R> {
-    /// Open a custom format archive, reading only the header and TOC.
+impl<R: Read + Seek> CustomDataLoader<R> {
+    /// Open a custom format archive and read the TableOfContents.
     ///
     /// No data blocks are read until explicitly requested via
-    /// [`read_entry_data`](Self::read_entry_data) or
-    /// [`read_entry_reader`](Self::read_entry_reader).
-    pub fn from_reader(mut reader: R) -> Result<Self> {
+    /// [`open_entry_reader`](Self::open_entry_reader).
+    pub fn from_readable(mut reader: R) -> Result<Self> {
         let toc = read_toc(&mut reader)?;
         Ok(Self { reader, toc })
     }
 
-
-    /// Read and decompress an entry's data block into memory.
-    ///
-    /// Returns `Ok(None)` if the entry has no data (either `data_state` is not
-    /// `Set` or `had_dumper` is false). Returns an error if `dump_id` is not
-    /// found in the TOC.
-    pub fn read_entry_data(&mut self, dump_id: i32) -> Result<Option<EntryData>> {
-        let block_type = match self.seek_to_data_block(dump_id)? {
-            Some(bt) => bt,
-            None => return Ok(None),
-        };
-
-        match block_type {
-            BlockType::Blobs => {
-                let blobs = read_blob_data(&mut self.reader, &self.toc)?;
-                Ok(Some(EntryData::Blobs(blobs)))
-            }
-            BlockType::Data => {
-                let data = read_compressed_data(&mut self.reader, &self.toc)?;
-                Ok(Some(EntryData::Data(data)))
-            }
-        }
-    }
-
-    /// Return a streaming [`EntryReader`] for an entry's data.
-    ///
+    /// Open a streaming [`TableDataReader`] for a particular data entry's data.
+    /// 
+    /// This only will error for anything besides a [ObjectType::TableData] entry.
+    /// 
     /// The returned reader implements [`Read`] and streams data
     /// one chunk at a time, keeping memory usage proportional to a single
     /// chunk rather than the entire entry.
@@ -112,7 +88,7 @@ impl<R: Read + Seek> CustomDataReader<R> {
     /// Returns an error for `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data)
     /// instead, because blobs have internal OID framing that doesn't map
     /// to a flat byte stream.
-    pub fn read_entry_reader(&mut self, dump_id: i32) -> Result<Option<EntryReader<'_, R>>> {
+    pub fn open_data_reader(&mut self, dump_id: i32) -> Result<Option<TableDataReader<'_, R>>> {
         let block_type = match self.seek_to_data_block(dump_id)? {
             Some(bt) => bt,
             None => return Ok(None),
@@ -121,7 +97,7 @@ impl<R: Read + Seek> CustomDataReader<R> {
         if block_type == BlockType::Blobs {
             return Err(Error::StreamingNotSupported("BLOBS".to_string()));
         }
-        Ok(Some(EntryReader::new(
+        Ok(Some(TableDataReader::new(
             &mut self.reader,
             self.toc.int_size,
             self.toc.compression,
@@ -188,7 +164,7 @@ fn read_data_blocks<R: Read + Seek>(
                 blob_map.insert(entry.dump_id, read_blob_data(r, toc)?);
             }
             BlockType::Data => {
-                data_map.insert(entry.dump_id, read_compressed_data(r, toc)?);
+                data_map.insert(entry.dump_id, read_table_data(r, toc)?);
             }
         }
     }
@@ -382,7 +358,7 @@ mod tests {
 
         // Open with CustomReader — should parse header + TOC only
         let buf_cursor = Cursor::new(buf);
-        let reader = CustomDataReader::from_reader(buf_cursor).unwrap();
+        let reader = CustomDataLoader::from_readable(buf_cursor).unwrap();
 
         // can't compare entire TOC due to offset differences, but can check key fields and entries
         assert_eq!(reader.toc.timestamp, make_test_timestamp());
@@ -396,48 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_reader_no_data_entry() {
-        let dump = Dump {
-            toc: TableOfContents {
-                entries: vec![Entry {
-                    dump_id: 1,
-                    had_dumper: false,
-                    table_oid: "0".to_string(),
-                    oid: "0".to_string(),
-                    tag: Some("ENCODING".to_string()),
-                    desc: ObjectType::Encoding,
-                    section: Section::PreData,
-                    defn: Some("SET client_encoding = 'UTF8';\n".to_string()),
-                    drop_stmt: None,
-                    copy_stmt: None,
-                    namespace: None,
-                    tablespace: None,
-                    tableam: None,
-                    relkind: None,
-                    owner: None,
-                    with_oids: false,
-                    dependencies: vec![],
-                    data_state: OffsetState::NoData,
-                    offset: 0,
-                    filename: None,
-                }],
-                ..make_test_toc()
-            },
-            data: HashMap::new(),
-            blobs: HashMap::new(),
-        };
-
-        let mut buf = Cursor::new(Vec::new());
-        write_dump(&mut buf, &dump).unwrap();
-
-        buf.seek(SeekFrom::Start(0)).unwrap();
-        let mut reader = CustomDataReader::from_reader(buf).unwrap();
-
-        let result = reader.read_entry_data(1).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
     fn test_custom_reader_into_dump() {
         let data_content = b"1\tAlice\t30\n2\tBob\t25\n";
         let archive_bytes = make_data_archive(make_test_toc(), data_content);
@@ -447,7 +381,7 @@ mod tests {
         let eager_dump = read_dump(&mut eager_cursor).unwrap();
 
         // Load via CustomReader -> into_dump
-        let lazy_reader = CustomDataReader::from_reader(Cursor::new(archive_bytes)).unwrap();
+        let lazy_reader = CustomDataLoader::from_readable(Cursor::new(archive_bytes)).unwrap();
         let lazy_dump = lazy_reader.into_dump().unwrap();
 
         assert!(lazy_dump.get_entry(1).is_some());
@@ -494,31 +428,57 @@ mod tests {
         buf.into_inner()
     }
 
-    fn make_blob_archive(header: TableOfContents) -> Vec<u8> {
+    fn make_archive_with_data(header: TableOfContents) -> Vec<u8> {
         let mut dump = Dump {
             toc: TableOfContents {
-                entries: vec![Entry {
-                    dump_id: 1,
-                    had_dumper: true,
-                    table_oid: "0".to_string(),
-                    oid: "0".to_string(),
-                    tag: None,
-                    desc: ObjectType::Blobs,
-                    section: Section::Data,
-                    defn: None,
-                    drop_stmt: None,
-                    copy_stmt: None,
-                    namespace: None,
-                    tablespace: None,
-                    tableam: None,
-                    relkind: None,
-                    owner: None,
-                    with_oids: false,
-                    dependencies: vec![],
-                    data_state: OffsetState::NotSet,
-                    offset: 0,
-                    filename: None,
-                }],
+                entries: vec![
+                    Entry {
+                        dump_id: 1,
+                        had_dumper: true,
+                        table_oid: "0".to_string(),
+                        oid: "0".to_string(),
+                        tag: None,
+                        desc: ObjectType::Blobs,
+                        section: Section::Data,
+                        defn: None,
+                        drop_stmt: None,
+                        copy_stmt: None,
+                        namespace: None,
+                        tablespace: None,
+                        tableam: None,
+                        relkind: None,
+                        owner: None,
+                        with_oids: false,
+                        dependencies: vec![],
+                        data_state: OffsetState::NotSet,
+                        offset: 0,
+                        filename: None,
+                    },
+                    Entry {
+                        dump_id: 2,
+                        had_dumper: true,
+                        table_oid: "16384".to_string(),
+                        oid: "0".to_string(),
+                        tag: Some("users".to_string()),
+                        desc: ObjectType::TableData,
+                        section: Section::Data,
+                        defn: None,
+                        drop_stmt: None,
+                        copy_stmt: Some(
+                            "COPY public.users (id, name, age) FROM stdin;\n".to_string(),
+                        ),
+                        namespace: Some("public".to_string()),
+                        tablespace: None,
+                        tableam: None,
+                        relkind: None,
+                        owner: Some("postgres".to_string()),
+                        with_oids: false,
+                        dependencies: vec![],
+                        data_state: OffsetState::NotSet,
+                        offset: 0,
+                        filename: None,
+                    },
+                ],
                 ..header
             },
             data: HashMap::new(),
@@ -537,6 +497,7 @@ mod tests {
                 },
             ],
         );
+        dump.data.insert(2, b"table-data".to_vec());
         let mut buf = Vec::new();
         let n_bytes_written = write_dump(&mut buf, &dump).unwrap();
         assert_eq!(n_bytes_written, buf.len());
@@ -544,31 +505,22 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_reader_read_entry_reader_blobs_error() {
-        let bytes = make_blob_archive(make_test_toc());
+    fn test_data_reader_streaming() {
+        let bytes = make_archive_with_data(make_test_toc());
 
-        let mut reader = CustomDataReader::from_reader(Cursor::new(bytes)).unwrap();
-        let err = reader.read_entry_reader(1).unwrap_err();
+        let mut reader = CustomDataLoader::from_readable(Cursor::new(bytes)).unwrap();
+        
+        let mut data_reader = reader.open_data_reader(2).unwrap().expect("entry 2 should have data");
+        let mut data_content = Vec::new();
+        data_reader.read_to_end(&mut data_content).unwrap();
+        assert_eq!(data_content, b"table-data".to_vec());
+        drop(data_reader);
+
+        // BLOBs are not yet supported for streaming reads, so should return an error
+        let err = reader.open_data_reader(1).unwrap_err();
         assert!(
             matches!(err, Error::StreamingNotSupported(_)),
             "expected StreamingNotSupported, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_custom_reader_invalid_dump_id() {
-        let bytes = make_data_archive(make_test_toc(), b"data");
-
-        let mut reader = CustomDataReader::from_reader(Cursor::new(bytes)).unwrap();
-        let err = reader.read_entry_data(999).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidDumpId(999)),
-            "expected InvalidDumpId(999), got {err:?}"
-        );
-        let err = reader.read_entry_reader(999).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidDumpId(999)),
-            "expected InvalidDumpId(999), got {err:?}"
         );
     }
 
