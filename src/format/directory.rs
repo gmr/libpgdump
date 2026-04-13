@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::compress;
-use crate::constants::MAGIC;
+use crate::io::toc::MAGIC;
 use crate::dump::Dump;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
@@ -24,7 +24,7 @@ pub fn read_dump(dir: &Path) -> Result<Dump> {
     let toc = read_metadata(dir)?;
 
     // Read data files and blobs from the directory
-    let (data, blobs) = read_data_files(dir, &toc, &toc.entries)?;
+    let (data, blobs) = read_data_files(dir, &toc.entries)?;
 
     Ok(Dump { toc, data, blobs })
 }
@@ -86,24 +86,16 @@ pub fn write_dump(dir: &Path, dump: &Dump) -> Result<()> {
     let toc_path = dir.join("toc.dat");
     let mut toc_file = BufWriter::new(fs::File::create(&toc_path)?);
 
-    let toc_header = TableOfContents {
+    let toc = TableOfContents {
         format: Format::Tar, // directory format writes archTar in toc.dat
         ..dump.toc.clone()
     };
 
-    write_header(&mut toc_file, &toc_header)?;
-    write_timestamp(&mut toc_file, &dump.toc.timestamp, toc_header.int_size)?;
-    write_string(&mut toc_file, Some(&dump.toc.dbname), toc_header.int_size)?;
-    write_string(
-        &mut toc_file,
-        Some(&dump.toc.server_version),
-        toc_header.int_size,
-    )?;
-    write_string(
-        &mut toc_file,
-        Some(&dump.toc.dump_version),
-        toc_header.int_size,
-    )?;
+    write_header(&mut toc_file, &toc)?;
+    write_timestamp(&mut toc_file, &dump.toc.timestamp, toc.int_size)?;
+    write_string(&mut toc_file, Some(&dump.toc.dbname), toc.int_size)?;
+    write_string(&mut toc_file, Some(&dump.toc.server_version), toc.int_size)?;
+    write_string(&mut toc_file, Some(&dump.toc.dump_version), toc.int_size)?;
 
     let entry_count: i32 = dump
         .toc
@@ -111,10 +103,10 @@ pub fn write_dump(dir: &Path, dump: &Dump) -> Result<()> {
         .len()
         .try_into()
         .map_err(|_| Error::DataIntegrity("too many entries for i32".to_string()))?;
-    write_int(&mut toc_file, entry_count, toc_header.int_size)?;
+    write_int(&mut toc_file, entry_count, toc.int_size)?;
 
     for entry in &dump.toc.entries {
-        write_entry(&mut toc_file, entry, &toc_header)?;
+        write_entry(&mut toc_file, entry, &toc)?;
     }
 
     // Write data files
@@ -369,9 +361,9 @@ fn read_entry<R: Read>(r: &mut R, header: &TableOfContents) -> Result<Entry> {
     })
 }
 
-fn write_entry<W: Write>(w: &mut W, entry: &Entry, header: &TableOfContents) -> Result<()> {
-    let int_size = header.int_size;
-    let version = header.version;
+fn write_entry<W: Write>(w: &mut W, entry: &Entry, toc: &TableOfContents) -> Result<()> {
+    let int_size = toc.int_size;
+    let version = toc.version;
 
     write_int(w, entry.dump_id, int_size)?;
     write_int(w, if entry.had_dumper { 1 } else { 0 }, int_size)?;
@@ -454,7 +446,6 @@ fn find_data_file(dir: &Path, base_name: &str) -> Option<(PathBuf, CompressionAl
 #[allow(clippy::type_complexity)]
 fn read_data_files(
     dir: &Path,
-    header: &TableOfContents,
     entries: &[Entry],
 ) -> Result<(HashMap<i32, Vec<u8>>, HashMap<i32, Vec<Blob>>)> {
     let mut data_map: HashMap<i32, Vec<u8>> = HashMap::new();
@@ -468,7 +459,7 @@ fn read_data_files(
 
         if entry.desc == ObjectType::Blobs {
             // Read blob TOC file and individual blob files
-            let blobs = read_blob_toc(dir, header, filename)?;
+            let blobs = read_blob_toc(dir, filename)?;
             if !blobs.is_empty() {
                 blob_map.insert(entry.dump_id, blobs);
             }
@@ -487,7 +478,7 @@ fn read_data_files(
 }
 
 /// Parse a blobs TOC file and read individual blob data files.
-fn read_blob_toc(dir: &Path, _header: &TableOfContents, toc_filename: &str) -> Result<Vec<Blob>> {
+fn read_blob_toc(dir: &Path, toc_filename: &str) -> Result<Vec<Blob>> {
     let toc_path = dir.join(toc_filename);
     if !toc_path.exists() {
         return Ok(Vec::new());

@@ -4,7 +4,8 @@ use std::path::Path;
 
 use libpgdump::dump::detect_file_format;
 use libpgdump::error::Result;
-use libpgdump::format::{custom, directory};
+use libpgdump::format::directory;
+use libpgdump::io::toc::read_toc;
 use libpgdump::{Format, OffsetState, TableOfContents};
 
 /// A simple utility to print archive header and TOC entries without loading data blocks.
@@ -46,7 +47,7 @@ fn load_metadata(path: &Path) -> Result<TableOfContents> {
         Format::Custom => {
             let file = File::open(path)?;
             let mut reader = BufReader::new(file);
-            custom::read_toc(&mut reader)
+            read_toc(&mut reader)
         }
         _ => unreachable!(
             "detect_file_format should only return Tar, Directory, or Custom for files"
