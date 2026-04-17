@@ -453,3 +453,58 @@ fn test_round_trip_tar_format() {
     assert_eq!(blobs[0].0, 42);
     assert_eq!(blobs[0].1, b"tar blob data");
 }
+
+/// Verify `CustomReader::read_entry_stream` works for all compression
+/// algorithms (previously it bailed out on compressed archives).
+#[test]
+fn test_read_entry_stream_all_compressions() {
+    use std::io::{BufReader, Read};
+
+    for alg in [
+        libpgdump::CompressionAlgorithm::None,
+        libpgdump::CompressionAlgorithm::Gzip,
+        libpgdump::CompressionAlgorithm::Lz4,
+        libpgdump::CompressionAlgorithm::Zstd,
+    ] {
+        let mut dump = libpgdump::new("testdb", "UTF8", "17.0").expect("new");
+        dump.set_compression(alg);
+        let data_id = dump
+            .add_entry(
+                ObjectType::TableData,
+                Some("public"),
+                Some("items"),
+                Some("postgres"),
+                None,
+                None,
+                Some("COPY public.items (id, value) FROM stdin;\n"),
+                &[],
+            )
+            .expect("add");
+        let mut expected = String::new();
+        for i in 0..500 {
+            expected.push_str(&format!("{i}\tvalue_{i}\n"));
+        }
+        dump.set_entry_data(data_id, expected.clone().into_bytes())
+            .expect("set_entry_data");
+
+        let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
+        dump.save(tmp.path()).expect("save");
+
+        let file = std::fs::File::open(tmp.path()).expect("open");
+        let mut reader =
+            libpgdump::format::custom::CustomReader::open(BufReader::new(file)).expect("open");
+        let dump_id = reader
+            .entries()
+            .iter()
+            .find(|e| e.desc == ObjectType::TableData && e.tag.as_deref() == Some("items"))
+            .expect("entry")
+            .dump_id;
+        let mut stream = reader
+            .read_entry_stream(dump_id)
+            .expect("stream")
+            .expect("has data");
+        let mut got = String::new();
+        stream.read_to_string(&mut got).expect("read");
+        assert_eq!(got, expected, "mismatch for compression {alg:?}");
+    }
+}

@@ -1,5 +1,7 @@
 pub mod compress;
 pub mod constants;
+pub mod copy_text;
+pub mod ddl;
 pub mod dump;
 pub mod entry;
 pub mod error;

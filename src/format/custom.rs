@@ -195,11 +195,8 @@ impl<R: Read + Seek> CustomReader<R> {
     /// - `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data)
     ///   instead, because blobs have internal OID framing that doesn't map
     ///   to a flat byte stream.
-    /// - Compressed archives — PostgreSQL writes compressed data as slices
-    ///   of a single continuous compressed stream per entry (not independently
-    ///   compressed chunks), so per-chunk streaming decompression would
-    ///   produce corrupt data. Use [`read_entry_data`](Self::read_entry_data)
-    ///   for compressed archives.
+    /// - Compressed archives — use [`read_entry_stream`](Self::read_entry_stream)
+    ///   which transparently layers a decompressor over the chunked frames.
     pub fn read_entry_reader(&mut self, dump_id: i32) -> Result<Option<EntryReader<'_, R>>> {
         let block_type = match self.seek_to_data_block(dump_id)? {
             Some(bt) => bt,
@@ -221,6 +218,42 @@ impl<R: Read + Seek> CustomReader<R> {
             done: false,
             decompressed_buf: Vec::new(),
             buf_pos: 0,
+        }))
+    }
+
+    /// Return a streaming [`Read`] over an entry's *decompressed* data.
+    ///
+    /// Works for both uncompressed and compressed archives. For compressed
+    /// archives, the chunked byte frames are concatenated on the fly and fed
+    /// into the appropriate decompressor (gzip / lz4 / zstd), so memory use
+    /// stays proportional to the decompressor's internal buffer rather than
+    /// the entry size.
+    ///
+    /// Returns `Ok(None)` if the entry has no data. Returns an error for
+    /// `BLOBS` entries — use [`read_entry_data`](Self::read_entry_data) for
+    /// those, since blobs carry internal OID framing that is not a flat byte
+    /// stream.
+    pub fn read_entry_stream(&mut self, dump_id: i32) -> Result<Option<Box<dyn Read + '_>>> {
+        let block_type = match self.seek_to_data_block(dump_id)? {
+            Some(bt) => bt,
+            None => return Ok(None),
+        };
+
+        if block_type == BlockType::Blobs {
+            return Err(Error::StreamingNotSupported("BLOBS".to_string()));
+        }
+
+        let raw = EntryReader {
+            reader: &mut self.reader,
+            int_size: self.header.int_size,
+            done: false,
+            decompressed_buf: Vec::new(),
+            buf_pos: 0,
+        };
+
+        Ok(Some(match self.header.compression {
+            CompressionAlgorithm::None => Box::new(raw) as Box<dyn Read + '_>,
+            alg => compress::decompressor(alg, raw)?,
         }))
     }
 

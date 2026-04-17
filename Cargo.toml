@@ -16,5 +16,22 @@ tempfile = "3"
 thiserror = "2"
 zstd = "0.13"
 
+# Optional CLI-only deps (gated behind the `cli` feature).
+arrow-array = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+parquet = { version = "53", optional = true, default-features = false, features = ["arrow", "zstd", "snap"] }
+clap = { version = "4", optional = true, features = ["derive"] }
+anyhow = { version = "1", optional = true }
+
+[features]
+default = []
+# Enables the `pgdump2parquet` binary and its arrow/parquet/clap dependencies.
+cli = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet", "dep:clap", "dep:anyhow"]
+
+[[bin]]
+name = "pgdump2parquet"
+path = "src/bin/pgdump2parquet.rs"
+required-features = ["cli"]
+
 [dev-dependencies]
 pretty_assertions = "1"
