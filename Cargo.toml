@@ -22,11 +22,17 @@ arrow-schema = { version = "53", optional = true }
 parquet = { version = "53", optional = true, default-features = false, features = ["arrow", "zstd", "snap"] }
 clap = { version = "4", optional = true, features = ["derive"] }
 anyhow = { version = "1", optional = true }
+# duckdb = bundled libduckdb, used by the `--engine duckdb` path in the CLI.
+# Bundled build is slow (minutes) but keeps the resulting binary fully
+# self-contained with no runtime dep on a system libduckdb.
+duckdb = { version = "1", optional = true, features = ["bundled", "parquet", "json"] }
 
 [features]
 default = []
-# Enables the `pgdump2parquet` binary and its arrow/parquet/clap dependencies.
+# The core CLI: Rust-only, arrow-rs + parquet writer, fast to build.
 cli = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet", "dep:clap", "dep:anyhow"]
+# Enables the `--engine duckdb` path (embedded libduckdb). Implies `cli`.
+cli-duckdb = ["cli", "dep:duckdb"]
 
 [[bin]]
 name = "pgdump2parquet"

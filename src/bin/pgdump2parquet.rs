@@ -32,6 +32,17 @@ use libpgdump::ddl;
 use libpgdump::format::custom::CustomReader;
 use libpgdump::types::ObjectType;
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum Engine {
+    /// Pure-Rust backend: arrow-rs + parquet crate. Every column is written
+    /// as Parquet VARCHAR; cast downstream with DuckDB's `TRY_CAST`.
+    Rust,
+    /// Embedded DuckDB (feature `cli-duckdb`). Stages rows as VARCHAR, then
+    /// uses DuckDB's `COPY ... TO 'x.parquet'` with `TRY_CAST` per column to
+    /// emit typed Parquet in a single pass.
+    Duckdb,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pgdump2parquet",
@@ -49,6 +60,9 @@ struct Cli {
     /// If no patterns are given, every table in the dump is converted.
     #[arg(short = 't', long = "table")]
     tables: Vec<String>,
+    /// Export backend.
+    #[arg(long, value_enum, default_value_t = Engine::Rust)]
+    engine: Engine,
     /// Rows per Arrow `RecordBatch` flushed to the Parquet writer. Tune this
     /// for very wide tables: smaller batches use less memory, larger batches
     /// amortise Parquet encoding overhead.
@@ -137,15 +151,26 @@ fn main() -> anyhow::Result<()> {
             .out_dir
             .join(format!("{}.{}.parquet", sanitize(&ns), sanitize(&tag)));
         eprint!("→ {ns}.{tag}  ({} cols)  ", cols.len());
-        let rows = convert_table(
-            &mut reader,
-            dump_id,
-            &cols,
-            &out_path,
-            cli.batch_rows,
-            cli.row_group_rows,
-            cli.zstd_level,
-        )?;
+        let rows = match cli.engine {
+            Engine::Rust => convert_table(
+                &mut reader,
+                dump_id,
+                &cols,
+                &out_path,
+                cli.batch_rows,
+                cli.row_group_rows,
+                cli.zstd_level,
+            )?,
+            Engine::Duckdb => convert_table_duckdb(
+                &mut reader,
+                dump_id,
+                &cols,
+                &out_path,
+                cli.batch_rows,
+                cli.row_group_rows,
+                cli.zstd_level,
+            )?,
+        };
         eprintln!("{rows} rows → {}", out_path.display());
         totals.0 += 1;
         totals.1 += rows as u64;
@@ -260,6 +285,25 @@ fn flush_batch(
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
     writer.write(&batch)?;
     Ok(())
+}
+
+#[cfg(feature = "cli-duckdb")]
+use libpgdump::duckdb_export::convert_table_duckdb;
+
+#[cfg(not(feature = "cli-duckdb"))]
+fn convert_table_duckdb<R: std::io::Read + std::io::Seek>(
+    _reader: &mut CustomReader<R>,
+    _dump_id: i32,
+    _cols: &[ddl::ColumnDef],
+    _out_path: &std::path::Path,
+    _batch_rows: usize,
+    _row_group_rows: usize,
+    _zstd_level: i32,
+) -> anyhow::Result<usize> {
+    anyhow::bail!(
+        "the `--engine duckdb` backend requires building with the `cli-duckdb` feature: \
+         cargo install --path . --features cli-duckdb"
+    )
 }
 
 /// Very small glob matcher: supports `*` (matches any number of chars, inc.
