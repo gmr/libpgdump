@@ -10,6 +10,12 @@ publish = false
 [dependencies]
 libpgdump = { path = "../.." }
 memchr = "2"
+# sqlparser (apache/datafusion-sqlparser-rs): pure-Rust SQL parser with
+# a native PostgreSQL dialect. Battle-tested in DataFusion/DuckDB-land
+# and handles every quirk of pg_dump-emitted `CREATE TABLE` DDL
+# (partitioned tables, inherited tables, composite types, generated
+# columns, etc.) without the maintenance burden of a hand parser.
+sqlparser = "0.61"
 thiserror = "2"
 # Per-table decompressors for the directory-format (`-Fd`) input path.
 # Each per-table file is a plain compressed stream (no custom-format

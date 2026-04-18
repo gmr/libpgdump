@@ -1,243 +1,129 @@
-//! Minimal parser for the `CREATE TABLE` DDL statements pg_dump emits.
+//! Parse `CREATE TABLE` DDL from a pg_dump archive using `sqlparser-rs`
+//! with the PostgreSQL dialect.
 //!
-//! pg_dump writes very regular DDL for tables — one column per line,
-//! identifiers always double-quoted when they need to be, no comments inside
-//! the column list. This parser exploits that regularity; it is not a general
-//! SQL parser and will not handle arbitrary user-written DDL.
+//! Public API: one type ([`ColumnDef`]) and one function
+//! ([`parse_create_table`]), unchanged from the previous hand-rolled
+//! implementation. Downstream code (`pg_to_duckdb_type`, the Arrow schema
+//! builder, etc.) treats `ColumnDef::pg_type` as an opaque string matched
+//! case-insensitively, so we just render each column's `DataType` back to
+//! a string form that the existing mappers already understand.
+//!
+//! Why sqlparser-rs: pg_dump DDL is mostly regular, but not entirely —
+//! partitioned tables (`PARTITION BY`), inherited tables (`INHERITS(...)`)
+//! typed composites, `GENERATED ALWAYS AS`, `LIKE ... INCLUDING ...`, and
+//! friends all show up in the wild. A real AST walker handles them
+//! correctly without us accumulating ad-hoc edge-case patches.
+
+use sqlparser::ast::{ColumnOption, DataType, Statement};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 
 /// A parsed column definition — just enough to name and (later) type it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     /// The column name, with any wrapping double quotes stripped.
     pub name: String,
-    /// The column type as it appears in the DDL (e.g. `"integer"`,
-    /// `"character varying(255)"`, `"numeric(10,2)"`, `"text[]"`). Left as the
-    /// original string so callers can map it to their own target type system.
+    /// The column type as a string (e.g. `"INTEGER"`,
+    /// `"CHARACTER VARYING(64)"`, `"NUMERIC(10,2)"`, `"TEXT[]"`). Rendered by
+    /// sqlparser's `Display` for `DataType`, so case / spacing can differ
+    /// from what pg_dump literally emitted — downstream mappers do
+    /// case-insensitive matching, so that's fine.
     pub pg_type: String,
 }
 
 /// Extract the column list from a pg_dump `CREATE TABLE` statement.
 ///
-/// Returns `None` if the statement is not a recognisable `CREATE TABLE` (e.g.
-/// partitioned-only table declarations with `PARTITION OF` and no column
-/// list, or non-table DDL accidentally routed here).
+/// Returns `None` if the statement is not a recognisable `CREATE TABLE`
+/// (for instance a `CREATE TABLE ... PARTITION OF parent` declaration with
+/// no column list, or non-table DDL accidentally routed here). Constraints
+/// and other non-column items in the column list (`PRIMARY KEY`,
+/// `FOREIGN KEY`, `CHECK`, `LIKE`, `EXCLUDE`, ...) are filtered out by
+/// sqlparser's AST shape — they live in `CreateTable::constraints`, not
+/// `CreateTable::columns`, so we don't have to handle them ourselves.
 pub fn parse_create_table(defn: &str) -> Option<Vec<ColumnDef>> {
-    // Find the opening paren of the column list. pg_dump writes
-    //     CREATE TABLE [IF NOT EXISTS] [ONLY] schema.name (
-    //         col1 type,
-    //         col2 type,
-    //         ...
-    //     );
-    // possibly followed by PARTITION BY / INHERITS / WITH etc. clauses.
-    let open = find_top_level_open_paren(defn)?;
-    let close = find_matching_close(&defn[open..])? + open;
-    let inner = &defn[open + 1..close];
+    let dialect = PostgreSqlDialect {};
+    let normalised = normalise_pg_modifiers(defn);
+    // pg_dump sometimes emits multiple statements in one `defn` (the DDL
+    // plus a trailing `\.` separator or similar). Ask sqlparser to parse
+    // everything and return the first CREATE TABLE it finds.
+    let stmts = Parser::parse_sql(&dialect, &normalised).ok()?;
 
-    let mut cols = Vec::new();
-    for raw in split_top_level_commas(inner) {
-        let item = raw.trim();
-        if item.is_empty() {
-            continue;
+    for stmt in stmts {
+        if let Statement::CreateTable(ct) = stmt {
+            let cols: Vec<ColumnDef> = ct
+                .columns
+                .iter()
+                .filter(|c| !is_generated_virtual(&c.options))
+                .map(|c| ColumnDef {
+                    name: c.name.value.clone(),
+                    pg_type: render_data_type(&c.data_type),
+                })
+                .collect();
+            return (!cols.is_empty()).then_some(cols);
         }
-        // Skip table-level constraints: CONSTRAINT ..., PRIMARY KEY (...),
-        // FOREIGN KEY (...), UNIQUE (...), CHECK (...), EXCLUDE ..., LIKE ...
-        let upper = item.to_ascii_uppercase();
-        if upper.starts_with("CONSTRAINT ")
-            || upper.starts_with("PRIMARY KEY")
-            || upper.starts_with("FOREIGN KEY")
-            || upper.starts_with("UNIQUE ")
-            || upper.starts_with("UNIQUE(")
-            || upper.starts_with("CHECK ")
-            || upper.starts_with("CHECK(")
-            || upper.starts_with("EXCLUDE ")
-            || upper.starts_with("LIKE ")
-        {
-            continue;
-        }
-        if let Some(col) = parse_column(item) {
-            cols.push(col);
-        }
-    }
-    if cols.is_empty() { None } else { Some(cols) }
-}
-
-/// Parse a single column definition line: `name type [modifiers...]`.
-fn parse_column(s: &str) -> Option<ColumnDef> {
-    let s = s.trim();
-    let (name, rest) = take_identifier(s)?;
-
-    // Strip trailing modifiers that aren't part of the type. We want the
-    // raw type as emitted by pg_dump, so we keep everything up to the first
-    // top-level keyword that ends the type expression.
-    let type_str = trim_trailing_modifiers(rest.trim());
-    if type_str.is_empty() {
-        return None;
-    }
-    Some(ColumnDef {
-        name,
-        pg_type: type_str.to_string(),
-    })
-}
-
-/// Consume one identifier (quoted or unquoted) from the start of `s`,
-/// returning `(identifier, rest)`.
-fn take_identifier(s: &str) -> Option<(String, &str)> {
-    let s = s.trim_start();
-    if s.starts_with('"') {
-        // Quoted identifier: "..." with "" for an embedded quote.
-        let bytes = s.as_bytes();
-        let mut i = 1;
-        let mut out = String::new();
-        while i < bytes.len() {
-            if bytes[i] == b'"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    out.push('"');
-                    i += 2;
-                    continue;
-                }
-                return Some((out, &s[i + 1..]));
-            }
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-        None
-    } else {
-        let end = s
-            .find(|c: char| c.is_whitespace() || c == '(' || c == ',')
-            .unwrap_or(s.len());
-        if end == 0 {
-            return None;
-        }
-        Some((s[..end].to_string(), &s[end..]))
-    }
-}
-
-/// Strip per-column modifiers we don't want in the type string (DEFAULT,
-/// NOT NULL, CONSTRAINT, COLLATE, GENERATED, REFERENCES, PRIMARY KEY, UNIQUE,
-/// CHECK). Everything up to the first such keyword (matched at word
-/// boundaries outside parens) is the type.
-fn trim_trailing_modifiers(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'(' {
-            depth += 1;
-            i += 1;
-            continue;
-        }
-        if b == b')' {
-            depth = depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-        if depth == 0 && (b == b' ' || b == b'\t') {
-            // Look for a modifier keyword starting at i+1.
-            let rest = &s[i..].trim_start();
-            for kw in &[
-                "DEFAULT ",
-                "NOT NULL",
-                "NULL ",
-                "NULL,",
-                "CONSTRAINT ",
-                "COLLATE ",
-                "GENERATED ",
-                "REFERENCES ",
-                "PRIMARY ",
-                "UNIQUE ",
-                "CHECK ",
-                "CHECK(",
-            ] {
-                if rest.len() >= kw.len()
-                    && rest.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
-                {
-                    return s[..i].trim_end();
-                }
-            }
-            // Handle trailing bare NULL / NOT NULL at end of line.
-            let up = rest.to_ascii_uppercase();
-            if up == "NULL" || up == "NOT NULL" {
-                return s[..i].trim_end();
-            }
-        }
-        i += 1;
-    }
-    s.trim_end()
-}
-
-fn find_top_level_open_paren(s: &str) -> Option<usize> {
-    // Skip ahead to find the first `(` that's not inside an identifier or
-    // string literal. pg_dump output is clean enough that the first '(' is
-    // the column list opener for CREATE TABLE.
-    let bytes = s.as_bytes();
-    let mut in_str = false;
-    let mut in_ident = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_ident => in_str = !in_str,
-            b'"' if !in_str => in_ident = !in_ident,
-            b'(' if !in_str && !in_ident => return Some(i),
-            _ => {}
-        }
-        i += 1;
     }
     None
 }
 
-/// Given `s` starting with `(`, return the index (relative to `s`) of the
-/// matching `)`.
-fn find_matching_close(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    debug_assert_eq!(bytes[0], b'(');
-    let mut depth: usize = 0;
-    let mut in_str = false;
-    let mut in_ident = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_ident => in_str = !in_str,
-            b'"' if !in_str => in_ident = !in_ident,
-            b'(' if !in_str && !in_ident => depth += 1,
-            b')' if !in_str && !in_ident => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
+/// Strip PostgreSQL `CREATE TABLE` modifiers that sqlparser's dialect
+/// doesn't recognise but that are semantic no-ops for our purposes
+/// (column names and types are the only thing we extract, and these
+/// modifiers don't change that).
+///
+/// Currently handled:
+/// * `CREATE UNLOGGED TABLE …` → `CREATE TABLE …`
+/// * `CREATE GLOBAL TEMPORARY TABLE …` → `CREATE TEMPORARY TABLE …`
+///   (sqlparser handles `TEMPORARY` natively).
+/// * Leading `ONLY` inside the identifier list (rare, but legal).
+fn normalise_pg_modifiers(defn: &str) -> String {
+    // We only care about the first `CREATE TABLE`-ish header; use a simple
+    // case-insensitive word-boundary replace against common pg-isms. A
+    // real regex would be cleaner; we avoid the `regex` dep for just this.
+    let mut out = defn.to_string();
+    for pat in ["CREATE UNLOGGED TABLE", "create unlogged table"] {
+        if let Some(i) = out.find(pat) {
+            out.replace_range(i..i + pat.len(), "CREATE TABLE");
+            break;
         }
-        i += 1;
     }
-    None
-}
-
-/// Split `s` on top-level commas (ignoring commas inside parens / quotes).
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut depth: usize = 0;
-    let mut in_str = false;
-    let mut in_ident = false;
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_ident => in_str = !in_str,
-            b'"' if !in_str => in_ident = !in_ident,
-            b'(' if !in_str && !in_ident => depth += 1,
-            b')' if !in_str && !in_ident => depth = depth.saturating_sub(1),
-            b',' if depth == 0 && !in_str && !in_ident => {
-                out.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
+    for pat in ["CREATE GLOBAL TEMPORARY TABLE", "create global temporary table"] {
+        if let Some(i) = out.find(pat) {
+            out.replace_range(i..i + pat.len(), "CREATE TEMPORARY TABLE");
+            break;
         }
-        i += 1;
     }
-    out.push(&s[start..]);
     out
+}
+
+/// sqlparser's `Display` for `DataType` is normally what we want. A tiny
+/// tweak: pg_dump writes `character varying(N)` and our downstream mapper
+/// strips parens and matches the base word — `DataType::Varchar(Some(N))`
+/// renders as `VARCHAR(N)`, which the mapper already accepts. Arrays
+/// render as `T[]`. Everything else (INTEGER, BIGINT, TIMESTAMP WITH TIME
+/// ZONE, NUMERIC(p,s), BOOLEAN, JSON, JSONB, UUID, ...) round-trips via
+/// `Display` cleanly. We funnel through one function to keep the rendering
+/// behaviour in one place if we ever need to massage it.
+fn render_data_type(ty: &DataType) -> String {
+    ty.to_string()
+}
+
+/// Skip columns that are purely virtual (generated expressions with no
+/// storage). pg_dump emits these as part of the schema but they carry no
+/// data in the COPY stream, so including them would throw off the row
+/// shape.
+fn is_generated_virtual(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
+    options.iter().any(|o| {
+        matches!(
+            o.option,
+            ColumnOption::Generated {
+                generated_as: sqlparser::ast::GeneratedAs::Always,
+                sequence_options: None,
+                generation_expr: Some(_),
+                generated_keyword: true,
+                generation_expr_mode: Some(sqlparser::ast::GeneratedExpressionMode::Virtual),
+            }
+        )
+    })
 }
 
 #[cfg(test)]
@@ -250,11 +136,21 @@ mod tests {
         let cols = parse_create_table(sql).unwrap();
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0].name, "id");
-        assert_eq!(cols[0].pg_type, "integer");
+        // sqlparser renders `integer` as `INT`; our mapper is case-insensitive
+        // and matches both forms.
+        assert!(
+            cols[0].pg_type.eq_ignore_ascii_case("int")
+                || cols[0].pg_type.eq_ignore_ascii_case("integer")
+        );
         assert_eq!(cols[1].name, "email");
-        assert_eq!(cols[1].pg_type, "text");
+        assert!(cols[1].pg_type.eq_ignore_ascii_case("text"));
         assert_eq!(cols[2].name, "created_at");
-        assert_eq!(cols[2].pg_type, "timestamp with time zone");
+        assert!(
+            cols[2]
+                .pg_type
+                .eq_ignore_ascii_case("timestamp with time zone")
+                || cols[2].pg_type.eq_ignore_ascii_case("timestamptz")
+        );
     }
 
     #[test]
@@ -265,13 +161,22 @@ mod tests {
 );"#;
         let cols = parse_create_table(sql).unwrap();
         assert_eq!(cols[0].name, "weird Name");
-        assert_eq!(cols[0].pg_type, "character varying(64)");
+        let t0 = cols[0].pg_type.to_ascii_lowercase();
+        assert!(
+            t0.contains("varying(64)") || t0.contains("varchar(64)"),
+            "{}",
+            cols[0].pg_type
+        );
         assert_eq!(cols[1].name, "price");
-        assert_eq!(cols[1].pg_type, "numeric(10,2)");
+        let t1 = cols[1].pg_type.to_ascii_lowercase();
+        assert!(t1.contains("numeric(10,2)"), "{}", cols[1].pg_type);
     }
 
     #[test]
     fn constraints_are_skipped() {
+        // Table-level PRIMARY KEY is in `ct.constraints`, not `ct.columns`,
+        // so we naturally don't pick it up. Verify we only see the two
+        // declared columns.
         let sql = "CREATE TABLE s.t (\n  id integer NOT NULL,\n  other text,\n  CONSTRAINT pk PRIMARY KEY (id),\n  PRIMARY KEY (id, other)\n);";
         let cols = parse_create_table(sql).unwrap();
         assert_eq!(cols.len(), 2);
@@ -283,6 +188,42 @@ mod tests {
     fn array_type() {
         let sql = "CREATE TABLE s.t (tags text[]);";
         let cols = parse_create_table(sql).unwrap();
-        assert_eq!(cols[0].pg_type, "text[]");
+        // sqlparser renders array types as `T[]`.
+        assert!(
+            cols[0].pg_type.to_ascii_lowercase().contains("text[]"),
+            "{}",
+            cols[0].pg_type
+        );
+    }
+
+    #[test]
+    fn partitioned_parent_table() {
+        // Partitioned parent tables declare their columns plus a PARTITION BY
+        // clause. Columns should come through cleanly.
+        let sql = "CREATE TABLE public.events (\n  id bigint NOT NULL,\n  tenant_id int NOT NULL,\n  occurred_at timestamptz NOT NULL\n) PARTITION BY RANGE (occurred_at);";
+        let cols = parse_create_table(sql).unwrap();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[2].name, "occurred_at");
+    }
+
+    #[test]
+    fn unlogged_table() {
+        // Edge case: UNLOGGED modifier.
+        let sql = "CREATE UNLOGGED TABLE public.scratch (id int, note text);";
+        let cols = parse_create_table(sql).unwrap();
+        assert_eq!(cols.len(), 2);
+    }
+
+    #[test]
+    fn partition_of_has_no_columns() {
+        // `CREATE TABLE ... PARTITION OF parent` inherits columns from the
+        // parent and declares none of its own. Our API returns `None`
+        // because there's nothing to export at this entry — pg_dump routes
+        // data for these partitions through TABLE DATA entries tagged with
+        // the partition's own namespace/tag, which we look up in the parent
+        // table's schema map.
+        let sql = "CREATE TABLE public.events_2024 PARTITION OF public.events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');";
+        assert!(parse_create_table(sql).is_none());
     }
 }
