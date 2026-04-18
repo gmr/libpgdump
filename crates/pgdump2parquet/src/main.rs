@@ -1,14 +1,16 @@
-//! `pgdump2parquet` — convert a PostgreSQL custom-format dump (`pg_dump -Fc`)
+//! `pgdump2parquet` — convert a PostgreSQL dump (pg_dump `-Fc` or `-Fd`)
 //! directly to Parquet, one file per table, without going through Postgres.
 //!
 //! This crate is a thin CLI dispatcher. The actual work lives in:
 //!
-//! * `pgdump2parquet-core`  — COPY/DDL parsers, sink trait, per-table driver.
+//! * `pgdump2parquet-core`  — COPY/DDL parsers, sink trait, per-table driver,
+//!   and both input paths (custom format via libpgdump's `CustomReader`,
+//!   directory format via `DirectoryInput`).
 //! * `pgdump2parquet-arrow` — arrow-rs + parquet-crate sink (all-strings).
 //! * `pgdump2parquet-duckdb` — embedded DuckDB sink (typed columns).
 //!
-//! The `--engine` flag picks which sink factory to instantiate. The core
-//! driver is engine-agnostic and only sees the `ParquetSink` trait.
+//! The `--engine` flag picks which sink factory to instantiate. The input
+//! format (`-Fc` file vs `-Fd` directory) is auto-detected from the path.
 
 use std::collections::HashMap;
 use std::fs::{File, create_dir_all};
@@ -24,7 +26,7 @@ use clap::Parser;
 use libpgdump::format::custom::CustomReader;
 use libpgdump::types::{ObjectType, OffsetState};
 use pgdump2parquet_core::sink::{ParquetSinkFactory, SinkOpts, TableSchema};
-use pgdump2parquet_core::{ddl, drive_table};
+use pgdump2parquet_core::{DirectoryInput, ddl, drive_stream, drive_table};
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
 enum Engine {
@@ -100,89 +102,44 @@ fn default_parallel() -> usize {
         .unwrap_or(1)
 }
 
+/// Unified input-source abstraction. Shared by main (for TOC inspection)
+/// and the worker loop (for streaming per-table data). Cheap to clone — the
+/// variants hold `Arc`s so every worker shares the parsed TOC without
+/// reopening it.
+#[derive(Clone)]
+enum Input {
+    /// `-Fc` single-file archive. Each worker opens its own File/CustomReader
+    /// to get isolated seek state.
+    Custom { path: Arc<PathBuf> },
+    /// `-Fd` directory archive. The parsed TOC + compression are shared; each
+    /// worker opens a fresh file per table on demand.
+    Directory { input: Arc<DirectoryInput> },
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Parse the TOC once up front so we can plan jobs and compute size
-    // estimates. The per-worker CustomReaders open fresh file descriptors
-    // later; this reader is dropped when we leave the block.
-    let (schemas, all_entries_for_sizing) = {
-        let file = File::open(&cli.dump)
-            .map_err(|e| anyhow::anyhow!("opening {}: {e}", cli.dump.display()))?;
-        let reader = CustomReader::open(BufReader::new(file))?;
-        let mut schemas: HashMap<(String, String), Vec<ddl::ColumnDef>> = HashMap::new();
-        for e in reader.entries() {
-            if e.desc != ObjectType::Table {
-                continue;
-            }
-            let (Some(ns), Some(tag), Some(defn)) = (&e.namespace, &e.tag, &e.defn) else {
-                continue;
-            };
-            if let Some(cols) = ddl::parse_create_table(defn) {
-                schemas.insert((ns.clone(), tag.clone()), cols);
-            }
+    // Auto-detect format from the path. Directory = `-Fd`, file = `-Fc`.
+    let input = if cli.dump.is_dir() {
+        let dir_input = DirectoryInput::open(&cli.dump)
+            .map_err(|e| anyhow::anyhow!("opening -Fd dump at {}: {e}", cli.dump.display()))?;
+        Input::Directory {
+            input: Arc::new(dir_input),
         }
-        let entries: Vec<_> = reader
-            .entries()
-            .iter()
-            .map(|e| {
-                (
-                    e.dump_id,
-                    e.data_state,
-                    e.had_dumper,
-                    e.desc.clone(),
-                    e.offset,
-                    e.namespace.clone().unwrap_or_default(),
-                    e.tag.clone().unwrap_or_default(),
-                )
-            })
-            .collect();
-        (schemas, entries)
+    } else {
+        Input::Custom {
+            path: Arc::new(cli.dump.clone()),
+        }
     };
 
-    // Collect TABLE DATA jobs with a rough size estimate (derived from the
-    // gaps between consecutive data-block offsets in the archive). The
-    // estimate doesn't need to be exact — it's only used to schedule
-    // largest-first so big tables start on the first workers and smaller
-    // ones fill gaps as workers free up.
-    let file_size = std::fs::metadata(&cli.dump).map(|m| m.len()).unwrap_or(0);
-    let mut offsets: Vec<(i32, u64)> = all_entries_for_sizing
-        .iter()
-        .filter(|(_, state, had_dumper, _, _, _, _)| {
-            *state == OffsetState::Set && *had_dumper
-        })
-        .map(|(id, _, _, _, off, _, _)| (*id, *off))
-        .collect();
-    offsets.sort_by_key(|(_, o)| *o);
-    let mut size_by_dump_id: HashMap<i32, u64> = HashMap::new();
-    for i in 0..offsets.len() {
-        let (id, off) = offsets[i];
-        let end = offsets
-            .get(i + 1)
-            .map(|(_, o)| *o)
-            .unwrap_or(file_size.max(off));
-        size_by_dump_id.insert(id, end.saturating_sub(off));
-    }
-
-    let mut jobs: Vec<Job> = all_entries_for_sizing
-        .iter()
-        .filter(|(_, _, had_dumper, desc, _, _, _)| {
-            *desc == ObjectType::TableData && *had_dumper
-        })
-        .map(|(id, _, _, _, _, ns, tag)| Job {
-            dump_id: *id,
-            namespace: ns.clone(),
-            tag: tag.clone(),
-            size_hint: size_by_dump_id.get(id).copied().unwrap_or(0),
-        })
-        .filter(|j| {
-            cli.tables.is_empty()
-                || cli
-                    .tables
-                    .iter()
-                    .any(|pat| matches_simple_glob(pat, &format!("{}.{}", j.namespace, j.tag)))
-        })
-        .collect();
+    // Parse the TOC and derive (schemas, jobs) once up front. Each worker
+    // operates off the shared output; the reader opened here is dropped
+    // before workers start, so FDs are freed.
+    let (schemas, jobs) = match &input {
+        Input::Custom { path } => inspect_custom(path, &cli)?,
+        Input::Directory { input } => inspect_directory(input, &cli),
+    };
+    let mut jobs = jobs;
 
     if cli.list {
         jobs.sort_by(|a, b| b.size_hint.cmp(&a.size_hint));
@@ -230,12 +187,16 @@ fn main() -> anyhow::Result<()> {
     let total_rows = Arc::new(AtomicU64::new(0));
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let out_dir = Arc::new(cli.out_dir.clone());
-    let dump_path = Arc::new(cli.dump.clone());
 
     let nthreads = cli.parallel.max(1);
+    let format_name = match &input {
+        Input::Custom { .. } => "custom (-Fc)",
+        Input::Directory { .. } => "directory (-Fd)",
+    };
     eprintln!(
-        "processing {} table(s) across {} worker(s)",
+        "processing {} table(s) from {} dump across {} worker(s)",
         queue.lock().unwrap().len(),
+        format_name,
         nthreads
     );
 
@@ -248,13 +209,13 @@ fn main() -> anyhow::Result<()> {
         let total_rows = Arc::clone(&total_rows);
         let errors = Arc::clone(&errors);
         let out_dir = Arc::clone(&out_dir);
-        let dump_path = Arc::clone(&dump_path);
+        let input = input.clone();
         let skip_existing = cli.skip_existing;
 
         handles.push(thread::spawn(move || {
             if let Err(e) = worker_loop(
                 worker_id,
-                &dump_path,
+                &input,
                 &out_dir,
                 skip_existing,
                 factory,
@@ -298,7 +259,7 @@ struct Job {
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     worker_id: usize,
-    dump_path: &Path,
+    input: &Input,
     out_dir: &Path,
     skip_existing: bool,
     factory: Arc<dyn ParquetSinkFactory>,
@@ -307,14 +268,21 @@ fn worker_loop(
     total_tables: Arc<AtomicU64>,
     total_rows: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
-    // Each worker has its own file descriptor + CustomReader — the dump's
-    // TOC is parsed once per worker, which is a few ms even for huge dumps.
-    let file = File::open(dump_path)
-        .map_err(|e| anyhow::anyhow!("worker {worker_id}: opening {}: {e}", dump_path.display()))?;
-    let mut reader = CustomReader::open(BufReader::new(file))?;
+    // For `-Fc`, each worker owns its own `CustomReader` for seek-state
+    // isolation. For `-Fd`, all workers share the same `DirectoryInput`
+    // (only the TOC, which is read-only) and open fresh per-table files
+    // from disk for each job.
+    let mut custom_reader = match input {
+        Input::Custom { path } => {
+            let file = File::open(path.as_path()).map_err(|e| {
+                anyhow::anyhow!("worker {worker_id}: opening {}: {e}", path.display())
+            })?;
+            Some(CustomReader::open(BufReader::new(file))?)
+        }
+        Input::Directory { .. } => None,
+    };
 
     loop {
-        // Pop the largest remaining job from the end of the queue.
         let Some(job) = queue.lock().unwrap().pop() else {
             return Ok(());
         };
@@ -354,12 +322,27 @@ fn worker_loop(
         let mut sink = factory
             .open(&tmp, &schema)
             .map_err(|e| anyhow::anyhow!("opening sink for {}.{}: {e}", job.namespace, job.tag))?;
-        let rows = drive_table(
-            &mut reader,
-            job.dump_id,
-            schema.columns.len(),
-            sink.as_mut(),
-        )?;
+
+        let rows = match (input, custom_reader.as_mut()) {
+            (Input::Custom { .. }, Some(reader)) => drive_table(
+                reader,
+                job.dump_id,
+                schema.columns.len(),
+                sink.as_mut(),
+            )?,
+            (Input::Directory { input: dir }, _) => {
+                match dir.open_entry_stream(job.dump_id).map_err(|e| {
+                    anyhow::anyhow!("opening -Fd stream for {}.{}: {e}", job.namespace, job.tag)
+                })? {
+                    Some(stream) => {
+                        drive_stream(stream, schema.columns.len(), sink.as_mut())?
+                    }
+                    None => 0,
+                }
+            }
+            _ => unreachable!("input / reader combination is invalid"),
+        };
+
         let _stats = sink
             .close()
             .map_err(|e| anyhow::anyhow!("closing sink for {}.{}: {e}", job.namespace, job.tag))?;
@@ -376,6 +359,114 @@ fn worker_loop(
             out_path.display(),
         );
     }
+}
+
+/// Parse a `-Fc` dump's TOC and build the schema + job list. Size hints are
+/// derived from gaps between consecutive data-block offsets; that's a rough
+/// proxy for on-disk compressed size, accurate enough for largest-first
+/// scheduling.
+fn inspect_custom(
+    path: &Path,
+    cli: &Cli,
+) -> anyhow::Result<(
+    HashMap<(String, String), Vec<ddl::ColumnDef>>,
+    Vec<Job>,
+)> {
+    let file = File::open(path)
+        .map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
+    let reader = CustomReader::open(BufReader::new(file))?;
+
+    let mut schemas: HashMap<(String, String), Vec<ddl::ColumnDef>> = HashMap::new();
+    for e in reader.entries() {
+        if e.desc != ObjectType::Table {
+            continue;
+        }
+        let (Some(ns), Some(tag), Some(defn)) = (&e.namespace, &e.tag, &e.defn) else {
+            continue;
+        };
+        if let Some(cols) = ddl::parse_create_table(defn) {
+            schemas.insert((ns.clone(), tag.clone()), cols);
+        }
+    }
+
+    // Size estimate: sort data-bearing entries by offset, each entry's size
+    // is the gap to the next one (or to EOF for the last).
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut offsets: Vec<(i32, u64)> = reader
+        .entries()
+        .iter()
+        .filter(|e| e.data_state == OffsetState::Set && e.had_dumper)
+        .map(|e| (e.dump_id, e.offset))
+        .collect();
+    offsets.sort_by_key(|(_, o)| *o);
+    let mut size_by_dump_id: HashMap<i32, u64> = HashMap::new();
+    for i in 0..offsets.len() {
+        let (id, off) = offsets[i];
+        let end = offsets
+            .get(i + 1)
+            .map(|(_, o)| *o)
+            .unwrap_or(file_size.max(off));
+        size_by_dump_id.insert(id, end.saturating_sub(off));
+    }
+
+    let jobs: Vec<Job> = reader
+        .entries()
+        .iter()
+        .filter(|e| e.desc == ObjectType::TableData && e.had_dumper)
+        .map(|e| Job {
+            dump_id: e.dump_id,
+            namespace: e.namespace.clone().unwrap_or_default(),
+            tag: e.tag.clone().unwrap_or_default(),
+            size_hint: size_by_dump_id.get(&e.dump_id).copied().unwrap_or(0),
+        })
+        .filter(|j| matches_any_table(cli, j))
+        .collect();
+
+    Ok((schemas, jobs))
+}
+
+/// Parse a `-Fd` dump's `toc.dat` + each table file's on-disk size.
+fn inspect_directory(
+    input: &Arc<DirectoryInput>,
+    cli: &Cli,
+) -> (
+    HashMap<(String, String), Vec<ddl::ColumnDef>>,
+    Vec<Job>,
+) {
+    let mut schemas: HashMap<(String, String), Vec<ddl::ColumnDef>> = HashMap::new();
+    for e in input.entries() {
+        if e.desc != ObjectType::Table {
+            continue;
+        }
+        let (Some(ns), Some(tag), Some(defn)) = (&e.namespace, &e.tag, &e.defn) else {
+            continue;
+        };
+        if let Some(cols) = ddl::parse_create_table(defn) {
+            schemas.insert((ns.clone(), tag.clone()), cols);
+        }
+    }
+
+    let jobs: Vec<Job> = input
+        .entries()
+        .iter()
+        .filter(|e| e.desc == ObjectType::TableData && e.had_dumper)
+        .map(|e| Job {
+            dump_id: e.dump_id,
+            namespace: e.namespace.clone().unwrap_or_default(),
+            tag: e.tag.clone().unwrap_or_default(),
+            size_hint: input.data_file_size(e.dump_id),
+        })
+        .filter(|j| matches_any_table(cli, j))
+        .collect();
+
+    (schemas, jobs)
+}
+
+fn matches_any_table(cli: &Cli, j: &Job) -> bool {
+    cli.tables.is_empty()
+        || cli.tables.iter().any(|pat| {
+            matches_simple_glob(pat, &format!("{}.{}", j.namespace, j.tag))
+        })
 }
 
 fn make_factory(

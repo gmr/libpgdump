@@ -16,6 +16,7 @@
 pub mod block;
 pub mod copy_text;
 pub mod ddl;
+pub mod directory;
 pub mod sink;
 
 use std::io::{Read, Seek};
@@ -23,9 +24,19 @@ use std::io::{Read, Seek};
 use libpgdump::format::custom::CustomReader;
 
 pub use block::{BlockFrame, BlockReader, ColumnBuffer, ColumnarBlock, FieldRanges};
+pub use directory::{DirectoryInput, TocEntry};
 pub use sink::{ParquetSink, ParquetSinkFactory, SinkOpts, SinkStats, TableSchema};
 
-/// Stream one TABLE DATA entry into `sink`. Returns the row count written.
+/// 4MB block target — big enough that parquet writers don't see excessive
+/// tiny RecordBatches, small enough that peak arena stays a few MB per
+/// worker.
+pub const DEFAULT_BLOCK_TARGET: usize = 4 * 1024 * 1024;
+
+/// Stream one TABLE DATA entry from a custom-format (`-Fc`) dump into
+/// `sink`. Returns the row count written.
+///
+/// For directory-format (`-Fd`) dumps the caller has a raw decompressor
+/// stream per table and should call [`drive_stream`] directly.
 ///
 /// The sink is driven **block-at-a-time**: a [`BlockReader`] frames rows out
 /// of the decompressed stream into a reusable arena, fields are split with
@@ -50,12 +61,20 @@ pub fn drive_table<R: Read + Seek, S: ParquetSink + ?Sized>(
     else {
         return Ok(0);
     };
+    drive_stream(stream, n_cols, sink)
+}
 
-    // 4MB blocks by default — big enough that parquet writers don't see
-    // excessive tiny RecordBatches, small enough that peak arena stays a
-    // few MB per worker.
-    const BLOCK_TARGET: usize = 4 * 1024 * 1024;
-    let mut br = BlockReader::new(stream, BLOCK_TARGET);
+/// Drive the block pipeline from an arbitrary `Read` source (the same
+/// decompressed COPY-TEXT byte stream that [`drive_table`] produces
+/// internally). This is the entrypoint for the directory-format (`-Fd`)
+/// path, where the caller opens one gzip (or lz4/zstd) file per table and
+/// feeds it in directly — libpgdump isn't involved beyond TOC parsing.
+pub fn drive_stream<R: Read, S: ParquetSink + ?Sized>(
+    stream: R,
+    n_cols: usize,
+    sink: &mut S,
+) -> Result<usize, DriveError> {
+    let mut br = BlockReader::new(stream, DEFAULT_BLOCK_TARGET);
     let mut ranges = FieldRanges::new();
     let mut rows = 0usize;
 
@@ -65,8 +84,6 @@ pub fn drive_table<R: Read + Seek, S: ParquetSink + ?Sized>(
             ranges.fill(&frame, n_cols);
             rows += ranges.n_rows;
             let block = ColumnarBlock::build(&frame, &ranges);
-            // `block` owns its buffers; the `frame` borrow can be released
-            // here so the sink isn't limited by it.
             let _ = frame;
             sink.append_block(block).map_err(DriveError::Sink)?;
         }

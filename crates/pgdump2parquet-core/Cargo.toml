@@ -11,3 +11,21 @@ publish = false
 libpgdump = { path = "../.." }
 memchr = "2"
 thiserror = "2"
+# Per-table decompressors for the directory-format (`-Fd`) input path. The
+# per-table files in a -Fd dump are plain compressed streams (no custom-
+# format chunking), so we feed them through these decoders directly.
+#
+# flate2 defaults to `miniz_oxide` (pure Rust, ~150–300 MB/s).  Enable the
+# `fast-gzip` feature on this crate to swap in `zlib-ng` (C, ~400–600 MB/s),
+# which is worth it when the single-thread gunzip is the bottleneck on a
+# big gzip-compressed table (e.g. USAspending).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lz4_flex = "0.11"
+zstd = "0.13"
+
+[features]
+default = []
+# Swap flate2's default miniz_oxide backend for the C-based zlib-ng.
+# Needs a C compiler + cmake at build time; produces ~2–3× faster gunzip
+# on most CPUs.  See flate2's README for tradeoffs.
+fast-gzip = ["flate2/zlib-ng", "flate2/any_zlib"]
