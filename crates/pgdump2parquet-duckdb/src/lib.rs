@@ -30,11 +30,49 @@ use pgdump2parquet_core::sink::{
 #[derive(Debug, Clone)]
 pub struct DuckDbFactory {
     pub opts: SinkOpts,
+    /// Per-connection `PRAGMA threads`. Defaults to 1 because the CLI runs
+    /// N sinks in parallel — letting each DuckDB also fan out to all cores
+    /// leads to N×M thread stampede and cache thrash.
+    pub threads_per_sink: usize,
+    /// Per-connection `PRAGMA memory_limit`. `None` = DuckDB's default
+    /// (80% of system RAM), which is ruinous with N concurrent sinks.
+    /// Something like `"2GB"` is usually right for parallel runs.
+    pub memory_limit: Option<String>,
+    /// Per-connection `PRAGMA temp_directory`. Used when DuckDB spills the
+    /// staging table to disk. If `None`, DuckDB picks a default under
+    /// CWD which can collide across concurrent sinks — the CLI plugs in a
+    /// per-worker path here.
+    pub temp_directory: Option<String>,
 }
 
 impl DuckDbFactory {
     pub fn new(opts: SinkOpts) -> Self {
-        Self { opts }
+        Self {
+            opts,
+            threads_per_sink: 1,
+            memory_limit: None,
+            temp_directory: None,
+        }
+    }
+
+    /// Override the default `PRAGMA threads` for each DuckDB the factory
+    /// creates. `0` means "DuckDB default" (= all cores).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads_per_sink = threads;
+        self
+    }
+
+    /// Set `PRAGMA memory_limit` on each DuckDB the factory creates. Accepts
+    /// the usual DuckDB syntax, e.g. `"2GB"`, `"512MB"`.
+    pub fn with_memory_limit(mut self, limit: impl Into<String>) -> Self {
+        self.memory_limit = Some(limit.into());
+        self
+    }
+
+    /// Set `PRAGMA temp_directory` on each DuckDB the factory creates.
+    pub fn with_temp_directory(mut self, dir: impl Into<String>) -> Self {
+        self.temp_directory = Some(dir.into());
+        self
     }
 }
 
@@ -45,6 +83,22 @@ impl ParquetSinkFactory for DuckDbFactory {
         schema: &TableSchema,
     ) -> Result<Box<dyn ParquetSink>, SinkError> {
         let conn = Connection::open_in_memory().map_err(boxed)?;
+
+        // Apply resource caps BEFORE we create the staging table. A
+        // DuckDB-heavy laptop will happily light itself on fire if we don't.
+        if self.threads_per_sink > 0 {
+            conn.execute_batch(&format!("PRAGMA threads={};", self.threads_per_sink))
+                .map_err(boxed)?;
+        }
+        if let Some(ref lim) = self.memory_limit {
+            conn.execute_batch(&format!("PRAGMA memory_limit='{}';", sql_escape(lim)))
+                .map_err(boxed)?;
+        }
+        if let Some(ref td) = self.temp_directory {
+            conn.execute_batch(&format!("PRAGMA temp_directory='{}';", sql_escape(td)))
+                .map_err(boxed)?;
+        }
+
         let stage_cols = schema
             .columns
             .iter()
@@ -219,6 +273,13 @@ fn quote_ident(s: &str) -> String {
 fn sql_quote(s: &str) -> String {
     let escaped = s.replace('\'', "''");
     format!("'{escaped}'")
+}
+
+/// Escape a string to go inside single quotes in a PRAGMA. Mirrors
+/// `sql_quote` but returns the *inside* of the quotes so the caller can
+/// interpolate without nesting formats.
+fn sql_escape(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 fn boxed<E: std::error::Error + Send + Sync + 'static>(e: E) -> SinkError {
