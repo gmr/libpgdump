@@ -12,4 +12,6 @@ pgdump2parquet-core = { path = "../pgdump2parquet-core" }
 # Bundled libduckdb plus the `parquet` and `json` extensions so the binary
 # is fully self-contained and doesn't attempt an at-runtime extension
 # download (which fails on airgapped / sandboxed hosts).
-duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
+duckdb = { version = "1", features = ["bundled", "parquet", "json", "appender-arrow", "vtab-arrow"] }
+arrow-array = "54"
+arrow-schema = "54"

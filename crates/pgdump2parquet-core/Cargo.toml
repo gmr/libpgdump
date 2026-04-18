@@ -10,6 +10,13 @@ publish = false
 [dependencies]
 libpgdump = { path = "../.." }
 memchr = "2"
+# arrow crates for typed RecordBatch construction. Version 53 matches
+# what duckdb-rs 1.2 brings in, so RecordBatches produced here flow
+# straight into `Appender::append_record_batch` and the arrow-rs
+# Parquet writer without a second conversion step.
+arrow-array = "54"
+arrow-buffer = "54"
+arrow-schema = "54"
 # sqlparser (apache/datafusion-sqlparser-rs): pure-Rust SQL parser with
 # a native PostgreSQL dialect. Battle-tested in DataFusion/DuckDB-land
 # and handles every quirk of pg_dump-emitted `CREATE TABLE` DDL

@@ -313,11 +313,7 @@ fn worker_loop(
             continue;
         }
 
-        let schema = TableSchema {
-            namespace: job.namespace.clone(),
-            name: job.tag.clone(),
-            columns: cols,
-        };
+        let schema = TableSchema::new(job.namespace.clone(), job.tag.clone(), cols);
         let tmp = out_path.with_extension("parquet.tmp");
         let mut sink = factory
             .open(&tmp, &schema)
@@ -327,16 +323,14 @@ fn worker_loop(
             (Input::Custom { .. }, Some(reader)) => drive_table(
                 reader,
                 job.dump_id,
-                schema.columns.len(),
+                &schema.arrow_schema,
                 sink.as_mut(),
             )?,
             (Input::Directory { input: dir }, _) => {
                 match dir.open_entry_stream(job.dump_id).map_err(|e| {
                     anyhow::anyhow!("opening -Fd stream for {}.{}: {e}", job.namespace, job.tag)
                 })? {
-                    Some(stream) => {
-                        drive_stream(stream, schema.columns.len(), sink.as_mut())?
-                    }
+                    Some(stream) => drive_stream(stream, &schema.arrow_schema, sink.as_mut())?,
                     None => 0,
                 }
             }

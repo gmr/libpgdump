@@ -1,25 +1,28 @@
 //! DuckDB-backed [`ParquetSink`] implementation for `pgdump2parquet`.
 //!
-//! Per-table flow:
+//! The core driver now hands us a typed Arrow `RecordBatch` per block
+//! (schema derived from the parsed DDL), so this sink is a thin wrapper:
 //!
-//! 1. Open an in-memory DuckDB.
-//! 2. `CREATE TABLE _stage (col1 VARCHAR, col2 VARCHAR, ...)`.
-//! 3. Rows arrive via [`ParquetSink::append_row`] and are pushed into
-//!    `_stage` through DuckDB's [`Appender`] (the fastest bulk-insert path).
-//! 4. On [`ParquetSink::close`], run
-//!    `COPY (SELECT TRY_CAST(col AS <target>), ...) TO 'out.parquet'` so
-//!    DuckDB does the CAST and Parquet encoding in one pass with its native
-//!    optimisations (parallel row groups, dictionary encoding, zstd).
+//! 1. `CREATE TABLE _stage (<typed DDL>)` inside an in-memory DuckDB. The
+//!    types come from [`pg_to_duckdb_type`], which mirrors the Arrow-side
+//!    [`pgdump2parquet_core::typed::pg_to_arrow_type`] mapping.
+//! 2. Rows arrive via [`ParquetSink::append_batch`] and are pushed into
+//!    `_stage` as a whole chunk via DuckDB's `Appender::append_record_batch`
+//!    (one FFI call per batch, not per row).
+//! 3. On [`ParquetSink::close`], `COPY _stage TO 'out.parquet'` — no
+//!    `TRY_CAST` rewrite, the staging table is already typed.
 //!
-//! Why stage as VARCHAR and `TRY_CAST` at export (rather than typing the
-//! staging table up front): pg's COPY TEXT encoding doesn't always match
-//! DuckDB's input conventions. `TRY_CAST` degrades unparsable values to
-//! NULL instead of failing the whole export — an important property when
-//! you're liberating a dump with imperfect DDL translation.
+//! Why keep a staging table at all: streaming an Arrow scan straight into
+//! a `COPY (SELECT ... FROM arrow_scan(...)) TO ...` avoids the stage, but
+//! needs a VTab-backed multi-batch producer that duckdb-rs 1.2.2 doesn't
+//! expose directly. That's the next refactor; for now the stage is typed
+//! and the append path is chunk-at-a-time, which already beats the old
+//! row-at-a-time VARCHAR path on wide tables.
 
-use duckdb::{Appender, Connection, appender_params_from_iter};
+use arrow_array::RecordBatch;
+use arrow_schema::DataType;
+use duckdb::{Appender, Connection};
 
-use pgdump2parquet_core::block::{ColumnBuffer, ColumnarBlock};
 use pgdump2parquet_core::ddl::ColumnDef;
 use pgdump2parquet_core::sink::{
     ParquetSink, ParquetSinkFactory, SinkError, SinkOpts, SinkStats, TableSchema,
@@ -56,21 +59,16 @@ impl DuckDbFactory {
         }
     }
 
-    /// Override the default `PRAGMA threads` for each DuckDB the factory
-    /// creates. `0` means "DuckDB default" (= all cores).
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads_per_sink = threads;
         self
     }
 
-    /// Set `PRAGMA memory_limit` on each DuckDB the factory creates. Accepts
-    /// the usual DuckDB syntax, e.g. `"2GB"`, `"512MB"`.
     pub fn with_memory_limit(mut self, limit: impl Into<String>) -> Self {
         self.memory_limit = Some(limit.into());
         self
     }
 
-    /// Set `PRAGMA temp_directory` on each DuckDB the factory creates.
     pub fn with_temp_directory(mut self, dir: impl Into<String>) -> Self {
         self.temp_directory = Some(dir.into());
         self
@@ -85,8 +83,6 @@ impl ParquetSinkFactory for DuckDbFactory {
     ) -> Result<Box<dyn ParquetSink>, SinkError> {
         let conn = Connection::open_in_memory().map_err(boxed)?;
 
-        // Apply resource caps BEFORE we create the staging table. A
-        // DuckDB-heavy laptop will happily light itself on fire if we don't.
         if self.threads_per_sink > 0 {
             conn.execute_batch(&format!("PRAGMA threads={};", self.threads_per_sink))
                 .map_err(boxed)?;
@@ -100,31 +96,68 @@ impl ParquetSinkFactory for DuckDbFactory {
                 .map_err(boxed)?;
         }
 
+        // Typed staging DDL, driven off the same pg type strings the Arrow
+        // schema used. For any DuckDB type we can't produce from a bare
+        // Arrow type we fall back to VARCHAR — matches the Arrow sink's
+        // Utf8 fallback and keeps the append compatible.
         let stage_cols = schema
             .columns
             .iter()
-            .map(|c| format!("{} VARCHAR", quote_ident(&c.name)))
+            .zip(schema.arrow_schema.fields().iter())
+            .map(|(c, f)| {
+                let ty = duckdb_type_for(c, f.data_type());
+                format!("{} {}", quote_ident(&c.name), ty)
+            })
             .collect::<Vec<_>>()
             .join(", ");
         conn.execute_batch(&format!("CREATE TABLE _stage ({stage_cols});"))
             .map_err(boxed)?;
 
-        let ncols = schema.columns.len();
         Ok(Box::new(DuckDbSink {
             conn,
-            cols: schema.columns.clone(),
             out_path: out.to_path_buf(),
             row_group_rows: self.opts.row_group_rows,
             zstd_level: self.opts.zstd_level,
-            ncols,
             total_rows: 0,
         }))
     }
 }
 
-/// Map a pg type string (as it appears in a `CREATE TABLE`) to the DuckDB
-/// type we'll cast to at export time. Anything we don't recognise stays as
-/// `VARCHAR` so the value is still preserved losslessly.
+/// Pick a DuckDB column type given (a) the pg type string from the DDL and
+/// (b) the Arrow type the core driver decided to emit. We defer to the
+/// Arrow decision for anything it typed, and use pg-level knowledge to
+/// type a few things Arrow rendered as Utf8 (e.g. UUID, JSON). Anything
+/// still ambiguous stays VARCHAR — `append_record_batch` will store the
+/// Arrow `Utf8` value as-is.
+fn duckdb_type_for(col: &ColumnDef, arrow_type: &DataType) -> String {
+    match arrow_type {
+        DataType::Boolean => "BOOLEAN".into(),
+        DataType::Int16 => "SMALLINT".into(),
+        DataType::Int32 => "INTEGER".into(),
+        DataType::Int64 => "BIGINT".into(),
+        DataType::Float32 => "REAL".into(),
+        DataType::Float64 => "DOUBLE".into(),
+        DataType::Date32 => "DATE".into(),
+        DataType::Timestamp(_, None) => "TIMESTAMP".into(),
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ".into(),
+        DataType::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
+        DataType::Utf8 | DataType::LargeUtf8 => pg_to_duckdb_varchar_fallback(&col.pg_type),
+        _ => "VARCHAR".into(),
+    }
+}
+
+/// For Arrow `Utf8` columns, pick a DuckDB type that can still ingest the
+/// value via the `VARCHAR` codepath but preserves intent where it helps.
+/// Today: keep everything as VARCHAR — typed-cast of UUID/JSON/array
+/// values from a string would fail on malformed rows and we want the
+/// liberal, `TRY_CAST`-like behavior the rest of the pipeline has.
+fn pg_to_duckdb_varchar_fallback(_pg_type: &str) -> String {
+    "VARCHAR".into()
+}
+
+/// Legacy public helper — retained so the existing unit tests and any
+/// out-of-tree consumers keep working. Prefer [`duckdb_type_for`] inside
+/// this crate.
 pub fn pg_to_duckdb_type(pg_type: &str) -> String {
     let t = pg_type.trim();
     if t.ends_with("[]") || t.starts_with("ARRAY") || t.contains(" ARRAY") {
@@ -167,8 +200,6 @@ pub fn pg_to_duckdb_type(pg_type: &str) -> String {
 
 struct DuckDbSink {
     conn: Connection,
-    cols: Vec<ColumnDef>,
-    ncols: usize,
     out_path: std::path::PathBuf,
     row_group_rows: usize,
     zstd_level: i32,
@@ -176,68 +207,21 @@ struct DuckDbSink {
 }
 
 impl ParquetSink for DuckDbSink {
-    fn append_block(&mut self, block: ColumnarBlock) -> Result<(), SinkError> {
-        if block.n_rows == 0 {
+    fn append_batch(&mut self, batch: RecordBatch) -> Result<(), SinkError> {
+        if batch.num_rows() == 0 {
             return Ok(());
         }
-        if block.columns.len() != self.ncols {
-            return Err(boxed(std::io::Error::other(format!(
-                "column count mismatch: block has {}, schema has {}",
-                block.columns.len(),
-                self.ncols
-            ))));
-        }
-
-        // Build one column-slice view per column so we can index by row
-        // without allocating per-row Options. `field` returns `Option<&str>`
-        // straight out of the Arrow-shaped buffers. The block owns the
-        // underlying Vecs for the duration of this call.
-        let n_rows = block.n_rows;
-        let views: Vec<ColumnView<'_>> = block
-            .columns
-            .iter()
-            .map(|c| ColumnView::from(c, n_rows))
-            .collect::<Result<_, SinkError>>()?;
-
+        let n = batch.num_rows();
         let mut app: Appender<'_> = self.conn.appender("_stage").map_err(boxed)?;
-        let mut row_params: Vec<Option<&str>> = Vec::with_capacity(self.ncols);
-        for r in 0..n_rows {
-            row_params.clear();
-            for v in &views {
-                row_params.push(v.field(r));
-            }
-            app.append_row(appender_params_from_iter(row_params.iter()))
-                .map_err(boxed)?;
-        }
+        app.append_record_batch(batch).map_err(boxed)?;
         drop(app);
-
-        self.total_rows += n_rows;
+        self.total_rows += n;
         Ok(())
     }
 
     fn close(self: Box<Self>) -> Result<SinkStats, SinkError> {
-        let select_list = self
-            .cols
-            .iter()
-            .map(|c| {
-                let dt = pg_to_duckdb_type(&c.pg_type);
-                if dt == "VARCHAR" {
-                    quote_ident(&c.name)
-                } else {
-                    format!(
-                        "TRY_CAST({} AS {}) AS {}",
-                        quote_ident(&c.name),
-                        dt,
-                        quote_ident(&c.name)
-                    )
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
         let copy_sql = format!(
-            "COPY (SELECT {select_list} FROM _stage) TO {} \
-             (FORMAT PARQUET, COMPRESSION 'zstd', COMPRESSION_LEVEL {}, ROW_GROUP_SIZE {});",
+            "COPY _stage TO {} (FORMAT PARQUET, COMPRESSION 'zstd', COMPRESSION_LEVEL {}, ROW_GROUP_SIZE {});",
             sql_quote(self.out_path.to_string_lossy().as_ref()),
             self.zstd_level,
             self.row_group_rows,
@@ -249,81 +233,6 @@ impl ParquetSink for DuckDbSink {
     }
 }
 
-/// Zero-allocation row access over a block column. Resolves NULLs via the
-/// packed validity bitmap and slices into the Arrow-shaped values buffer
-/// using the offsets array. UTF-8 validation is done per-value by the
-/// DuckDB appender's binding layer, so we pass raw `&str` where we can;
-/// non-UTF-8 bytes fall back to a lossy conversion cached for the lifetime
-/// of the column view.
-struct ColumnView<'a> {
-    n_rows: usize,
-    values: &'a [u8],
-    offsets: &'a [i32],
-    validity: Option<&'a [u8]>,
-    /// Lazily populated when a non-UTF-8 value is encountered.
-    owned_strings: std::cell::UnsafeCell<Vec<Option<String>>>,
-}
-
-impl<'a> ColumnView<'a> {
-    fn from(col: &'a ColumnBuffer, n_rows: usize) -> Result<Self, SinkError> {
-        if col.offsets.len() != n_rows + 1 {
-            return Err(boxed(std::io::Error::other(format!(
-                "offsets length {} != n_rows+1 ({})",
-                col.offsets.len(),
-                n_rows + 1
-            ))));
-        }
-        Ok(ColumnView {
-            n_rows,
-            values: &col.values,
-            offsets: &col.offsets,
-            validity: col.validity.as_deref(),
-            owned_strings: std::cell::UnsafeCell::new(Vec::new()),
-        })
-    }
-
-    fn is_null(&self, row: usize) -> bool {
-        match self.validity {
-            None => false,
-            Some(bits) => bits[row / 8] & (1u8 << (row % 8)) == 0,
-        }
-    }
-
-    fn field(&self, row: usize) -> Option<&str> {
-        if row >= self.n_rows || self.is_null(row) {
-            return None;
-        }
-        let start = self.offsets[row] as usize;
-        let end = self.offsets[row + 1] as usize;
-        let bytes = &self.values[start..end];
-        match std::str::from_utf8(bytes) {
-            Ok(s) => Some(s),
-            Err(_) => {
-                // Lazily materialise a lossy owned copy for this row.
-                // SAFETY: we never hand out two mutable refs to the Vec
-                // (`UnsafeCell` is only touched here, and the returned
-                // reference is to a string inside it that is never removed).
-                unsafe {
-                    let v = &mut *self.owned_strings.get();
-                    if v.len() < self.n_rows {
-                        v.resize(self.n_rows, None);
-                    }
-                    if v[row].is_none() {
-                        v[row] = Some(String::from_utf8_lossy(bytes).into_owned());
-                    }
-                    v[row].as_deref()
-                }
-            }
-        }
-    }
-}
-
-// SAFETY: the `UnsafeCell` is only mutated from `&self` in a way that
-// never produces overlapping borrows (each `field` call returns a borrow
-// into a stable slot). The sink is also `!Sync` in practice because it
-// holds a DuckDB `Connection` that isn't Sync; we assert Send only.
-unsafe impl Send for ColumnView<'_> {}
-
 fn quote_ident(s: &str) -> String {
     let escaped = s.replace('"', "\"\"");
     format!("\"{escaped}\"")
@@ -334,9 +243,6 @@ fn sql_quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Escape a string to go inside single quotes in a PRAGMA. Mirrors
-/// `sql_quote` but returns the *inside* of the quotes so the caller can
-/// interpolate without nesting formats.
 fn sql_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
