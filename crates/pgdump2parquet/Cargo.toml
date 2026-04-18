@@ -22,10 +22,12 @@ default = []
 # Enables the `--engine duckdb` code path. Without this feature, selecting
 # that engine at runtime exits with an error message.
 duckdb = ["dep:pgdump2parquet-duckdb"]
-# Swap flate2's default miniz_oxide gzip backend for C-based zlib-ng.
-# Roughly 2-3× faster gunzip on most CPUs; requires a C compiler at
-# build time.  Useful when single-thread gunzip is the bottleneck on a
-# big gzip-compressed table (e.g. USAspending's 43 GB `.dat.gz` files).
+# Swap flate2's default pure-Rust `miniz_oxide` backend for **zlib-rs**,
+# a newer pure-Rust implementation from Trifecta Tech Foundation that
+# benchmarks faster than zlib-ng and Chromium's zlib at every relevant
+# chunk size. No C dependencies, no extra build-time tooling.
+# Worth it when single-thread gunzip is the bottleneck on a big
+# gzip-compressed table (e.g. USAspending's 43 GB `.dat.gz` files).
 fast-gzip = ["pgdump2parquet-core/fast-gzip"]
 
 [[bin]]
