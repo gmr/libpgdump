@@ -17,6 +17,10 @@ memchr = "2"
 arrow-array = "54"
 arrow-buffer = "54"
 arrow-schema = "54"
+# arrow-cast gives us a vectorised Utf8 -> {Int,Float,Decimal,Date,
+# Timestamp,...} with `safe: true` parse-failure-to-NULL semantics.
+# Replaces hand-rolled per-cell parsers in the typed module.
+arrow-cast = "54"
 # sqlparser (apache/datafusion-sqlparser-rs): pure-Rust SQL parser with
 # a native PostgreSQL dialect. Battle-tested in DataFusion/DuckDB-land
 # and handles every quirk of pg_dump-emitted `CREATE TABLE` DDL

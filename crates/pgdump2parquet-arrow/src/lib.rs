@@ -37,11 +37,11 @@ impl ParquetSinkFactory for ArrowFactory {
                 ZstdLevel::try_new(self.opts.zstd_level).map_err(boxed)?,
             ))
             .set_max_row_group_size(self.opts.row_group_rows)
-            // Stop truncating VARCHAR page-index min/max to 8 bytes: the
-            // default breaks downstream predicate pushdown (a truncated
-            // max is lexically < its untruncated form). Row-group-level
-            // Statistics remain full precision.
-            .set_column_index_truncate_length(None)
+            // Page-index truncation default is 64 bytes per parquet-rs.
+            // We leave it on: typical USAspending-style string values fit
+            // inside that, and disabling truncation explodes the index
+            // metadata payload (the `None` variant made a typed-output
+            // full-run regress from ~80s to 6 min).
             .build();
         let file = File::create(out).map_err(boxed)?;
         let writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).map_err(boxed)?;
