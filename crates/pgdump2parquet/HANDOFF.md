@@ -5,17 +5,24 @@ before we break for real-world testing. Everything here is pushed to origin.
 
 ## What exists
 
-A three-crate workspace under `crates/`:
+A four-crate workspace under `crates/` — three libraries plus a thin CLI
+dispatcher:
 
 * `pgdump2parquet-core`   — COPY-text + CREATE-TABLE parsers, block pipeline,
                             sink trait, per-table driver, directory-format
                             (`-Fd`) input reader. Zero modifications to the
                             base `libpgdump` crate.
 * `pgdump2parquet-arrow`  — arrow-rs + parquet crate sink (all-VARCHAR output,
-                            streaming row groups, bounded memory).
+                            row-group-bounded memory — buffers batches and
+                            flushes whole row groups at `max_row_group_size`,
+                            not true streaming).
 * `pgdump2parquet-duckdb` — embedded DuckDB sink via `duckdb-rs` (typed
                             output via `TRY_CAST`, resource caps applied).
 * `pgdump2parquet`        — thin CLI dispatcher. This is the binary.
+
+Input formats supported: `-Fc` (custom) and `-Fd` (directory). `-Ft` (tar) is
+**not supported** — there is a dead `Format::Tar` default arm in
+`core/src/directory.rs` that is never actually handled.
 
 ## Building
 
@@ -69,13 +76,21 @@ Smoke test plan for a new session:
 Likely failure modes to watch for:
   * sqlparser-rs choking on a DDL variant (partitioned inheritance, custom
     types, FDW columns). If so: P4 below — swap to `pg_query` (libpg_query
-    FFI) as a fallback parser.
+    FFI) as a fallback parser. Today a parser failure aborts that table
+    (error is not recovered per-table in a structured way); document the
+    actual behavior before running at scale.
   * DuckDB backend OOM on wide tables with long text columns. If so: P3.
   * Single-table wall-clock dominated by gzip decompression. If so: P2
     gives 1.3-1.8× on that case.
-  * Non-UTF-8 bytes in a text field triggering a `StringArray` encode
-    error. Arrow sink falls back to `from_utf8_lossy` today; may need
-    a `BinaryArray` sink variant instead.
+  * Non-UTF-8 bytes in a text field. The Arrow sink writes strings via
+    `unsafe { StringArray::new_unchecked(...) }` (arrow/src/lib.rs:131-137)
+    — **there is no `from_utf8_lossy` fallback**; invalid UTF-8 will either
+    propagate as a bad string or surface as a hard error at Parquet
+    write time. Real fix: add a `BinaryArray` sink variant.
+  * Partial output files after a worker crash. The Arrow sink opens the
+    target file directly (no temp file + rename), so a crash mid-write
+    leaves a truncated `.parquet` on disk. `--skip-existing` will then
+    skip that table on rerun — delete partials before resuming.
 
 ## Ranked follow-ups (post-smoke-test)
 
@@ -104,9 +119,11 @@ deferred items in more detail.
 
 ## Sandbox / environment notes (for the next session)
 
-* `files.usaspending.gov` is NOT reachable from the coding-sandbox we were in —
-  `x-deny-reason: host_not_allowed` on the proxy. Run the smoke test from a
-  GCE VM or local dev box with general internet.
+* `files.usaspending.gov` reachability depends on the sandbox. The previous
+  environment returned `x-deny-reason: host_not_allowed`; a later review
+  session reached it successfully (HTTP 200, `content-length: 4945838906`).
+  Probe with `curl -sSI --max-time 20 <url>` before committing to a run, and
+  if blocked, fall back to a GCE VM or local box.
 * pg 16 server binaries live at `/usr/lib/postgresql/16/bin/*` (Ubuntu
   `postgresql-16` pkg); `su postgres -c ...` is how the fixture tests were
   run. Data dir `/tmp/pgfixture`, unix socket `/tmp/pgrun`, port 54320.

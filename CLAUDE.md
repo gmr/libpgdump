@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 libpgdump is a Rust library for reading and writing PostgreSQL dump files. Supports all three pg_dump formats: custom (`-Fc`), directory (`-Fd`), and tar (`-Ft`). All four compression algorithms are supported: none, gzip, lz4, zstd (tar format does not support compression).
 
+The repository is a Cargo workspace. The top-level crate is `libpgdump`; `crates/` hosts an experimental `pgdump2parquet` CLI plus sink backends — see `crates/pgdump2parquet/HANDOFF.md` for its state.
+
 ## Build Commands
 
 ```
@@ -16,7 +18,12 @@ cargo clippy              # lint
 cargo fmt                 # format
 cargo doc --no-deps       # build docs
 just check                # fmt-check + lint + test
-just bootstrap            # generate test fixtures (requires Docker)
+just bootstrap            # start dockerized pg 16, load fixtures/schema.sql,
+                          # generate data via bin/generate-fixture-data.py,
+                          # and write dumps to build/data/. Requires Docker
+                          # and Python 3 (creates .venv with faker, psycopg).
+just fixtures             # regenerate dumps against an already-running compose
+just release X.Y.Z        # bump Cargo.toml, tag, push (libpgdump only)
 ```
 
 ## Architecture
@@ -44,11 +51,21 @@ All three share the `ArchiveData` intermediate struct (defined in `custom.rs`) t
 - `src/version.rs` — Archive version handling and PG version mapping
 - `src/error.rs` — Error types using `thiserror`
 
+### Workspace crates (crates/)
+
+- `pgdump2parquet-core`   — COPY-text parser, CREATE-TABLE parser (sqlparser-rs), block pipeline, sink trait, `-Fd` directory-format reader. Zero libpgdump mods.
+- `pgdump2parquet-arrow`  — arrow-rs + parquet sink (all-VARCHAR, row-group-bounded memory).
+- `pgdump2parquet-duckdb` — embedded DuckDB sink (typed via `TRY_CAST`).
+- `pgdump2parquet`        — CLI dispatcher, binary target.
+
+Feature flags: `gzip-miniz` (default, pure Rust) vs `fast-gzip` (zlib-rs) — pick one — and `duckdb` to enable the embedded-DuckDB backend. See `crates/pgdump2parquet/HANDOFF.md` for build recipes and benchmarks.
+
 ## Testing
 
 - Unit tests are inline in each module
 - Integration tests in `tests/read_dump.rs` and `tests/round_trip.rs`; shared helpers in `tests/common/mod.rs`
 - Fixture-based tests require dump files in `build/data/` (generated via `just bootstrap`)
+- Fixtures cover `-Fc` (compressed, uncompressed, schema-only, data-only, inserts) and `-Fd` (compressed, uncompressed); `-Ft` fixtures are not bootstrapped.
 - Tests gracefully skip when fixtures are not present
 
 ## Key Design Decisions
