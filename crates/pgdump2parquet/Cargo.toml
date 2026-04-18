@@ -18,17 +18,24 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
 [features]
-default = []
-# Enables the `--engine duckdb` code path. Without this feature, selecting
-# that engine at runtime exits with an error message.
-duckdb = ["dep:pgdump2parquet-duckdb"]
-# Swap flate2's default pure-Rust `miniz_oxide` backend for **zlib-rs**,
-# a newer pure-Rust implementation from Trifecta Tech Foundation that
-# benchmarks faster than zlib-ng and Chromium's zlib at every relevant
-# chunk size. No C dependencies, no extra build-time tooling.
-# Worth it when single-thread gunzip is the bottleneck on a big
-# gzip-compressed table (e.g. USAspending's 43 GB `.dat.gz` files).
+# Default: pure-Rust, all-safe `miniz_oxide` gzip backend (via the core
+# crate's `gzip-miniz` feature).
+default = ["gzip-miniz"]
+# Mirror of the core crate's gzip backend features. Pick exactly one:
+# `gzip-miniz` (default) or `fast-gzip`. Using both still works (flate2
+# prefers zlib-rs when both are enabled) but wastes binary size.
+gzip-miniz = ["pgdump2parquet-core/gzip-miniz"]
+# Swap flate2's default `miniz_oxide` for **zlib-rs** — a pure-Rust zlib
+# by Trifecta Tech Foundation, faster than zlib-ng and Chromium's zlib
+# in their benchmarks. Some internal `unsafe` but no C deps and no extra
+# build-time tooling. Worth it when single-thread gunzip is the
+# bottleneck on a big gzip-compressed table (e.g. USAspending's 43 GB
+# `.dat.gz` files). Usage:
+#     cargo build --no-default-features --features fast-gzip[,duckdb]
 fast-gzip = ["pgdump2parquet-core/fast-gzip"]
+# Enables the `--engine duckdb` code path. Without this feature,
+# selecting that engine at runtime exits with an error message.
+duckdb = ["dep:pgdump2parquet-duckdb"]
 
 [[bin]]
 name = "pgdump2parquet"

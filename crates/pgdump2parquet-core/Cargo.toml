@@ -11,24 +11,31 @@ publish = false
 libpgdump = { path = "../.." }
 memchr = "2"
 thiserror = "2"
-# Per-table decompressors for the directory-format (`-Fd`) input path. The
-# per-table files in a -Fd dump are plain compressed streams (no custom-
-# format chunking), so we feed them through these decoders directly.
+# Per-table decompressors for the directory-format (`-Fd`) input path.
+# Each per-table file is a plain compressed stream (no custom-format
+# chunking inside), so we feed them through these decoders directly.
 #
-# flate2 defaults to `miniz_oxide` (pure Rust, ~150–300 MB/s).  Enable the
-# `fast-gzip` feature on this crate to swap in **zlib-rs**, a pure-Rust zlib
-# from Trifecta Tech Foundation that's faster than zlib-ng at every
-# relevant chunk size (see their benchmark post — ~6-13% faster than
-# zlib-ng for decompression at 1-65 KB chunks, and Chromium's zlib too).
-# Unlike zlib-ng, zlib-rs has zero C build dependencies.
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# flate2 backend is selected by the `gzip-miniz` / `fast-gzip` features
+# on this crate below. We pull in flate2 with *no* default features so
+# the backend is entirely caller-controlled — this mirrors the
+# recommended pattern in flate2's README and keeps the binary free of
+# unused backends.
+flate2 = { version = "1.1", default-features = false }
 lz4_flex = "0.11"
 zstd = "0.13"
 
 [features]
-default = []
-# Swap flate2's default miniz_oxide backend for **zlib-rs** — pure Rust,
-# faster than zlib-ng. Worth enabling whenever single-thread gunzip is the
-# bottleneck (e.g. a big `.dat.gz` per-table file in a `-Fd` dump).
-# No extra build-time deps — still pure Rust.
+# `gzip-miniz` (default): pure-Rust, all-safe `miniz_oxide`.
+default = ["gzip-miniz"]
+
+# Pure Rust, no unsafe code. ~150–300 MB/s gunzip on typical hardware.
+# This is the conservative choice and what you get by default.
+gzip-miniz = ["flate2/rust_backend"]
+
+# **zlib-rs** — a newer pure-Rust zlib by Trifecta Tech Foundation.
+# Benchmarks faster than zlib-ng (the leading C fork) at every relevant
+# chunk size; still pure Rust but uses some `unsafe` for SIMD.
+# Worth enabling whenever single-thread gunzip is the bottleneck
+# (e.g. a big `.dat.gz` per-table file in a `-Fd` dump). Usage:
+#     cargo build --no-default-features --features fast-gzip
 fast-gzip = ["flate2/zlib-rs"]
