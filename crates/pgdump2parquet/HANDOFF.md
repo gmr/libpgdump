@@ -92,15 +92,72 @@ Likely failure modes to watch for:
     leaves a truncated `.parquet` on disk. `--skip-existing` will then
     skip that table on rerun — delete partials before resuming.
 
+## USAspending smoke-test results (2026-04-18)
+
+Ran the 5-step plan against `usaspending-db-subset_20260406.zip` (4.6 GB
+zip, `-Fd` directory dump: `toc.dat` + 73 `.dat.gz` files). Build was
+`--features duckdb,fast-gzip --no-default-features`. 16 vCPU / 21 GB RAM.
+
+* `--list`: 73 tables parsed, TOC + DDL all OK. sqlparser-rs did **not**
+  choke on any real DDL — P4 can stay parked.
+* Full run, arrow engine (default), `-j 8`:
+  **73 tables, 96.9M rows, 3.8 GB parquet, 1m18s wall / 3m50s user.**
+  Zero failures. Biggest tables: `public.financial_accounts_by_awards`
+  (31M rows, 60 cols), `rpt.recipient_profile` (18M), `rpt.recipient_lookup`
+  (17M), `public.financial_accounts_by_program_activity_object_class` (10M).
+* Widest DDL in the set: `rpt.transaction_search_fpds` (374 cols) and
+  `rpt.transaction_search_fabs` (374 cols). Both parsed + converted clean.
+
+### Head-to-head vs. Postgres (rpt.transaction_search_fpds, 374 cols)
+
+`pg_restore -n rpt -t transaction_search_fpds` into a local pg 16
+(`/usr/lib/postgresql/16/bin`, data dir `/tmp/pgfixture`, socket
+`/tmp/pgrun`, port 54320). Compared pg to parquet-via-DuckDB:
+
+| check                                          | pg                       | parquet                   | result   |
+| ---------------------------------------------- | ------------------------ | ------------------------- | -------- |
+| row count                                      | 214,340                  | 214,340                   | match    |
+| column count                                   | 374                      | 374                       | match    |
+| column names + order (all 374)                 | —                        | —                         | match    |
+| `SUM(federal_action_obligation)`               | 21,942,106,132.63        | 21,942,106,132.63         | match *  |
+| `SUM(award_amount)`                            | 1,005,471,884,333.28     | 1,005,471,884,333.28      | match *  |
+| `SUM(LENGTH(recipient_name))`                  | 5,361,078                | 5,361,078                 | match    |
+| `COUNT(*) WHERE recipient_uei IS NULL`         | 30                       | 30                        | match    |
+| `COUNT(*) WHERE veteran_owned_business = TRUE` | 12,742                   | 12,742                    | match    |
+
+\* DuckDB `TRY_CAST AS DOUBLE` loses precision on trillion-scale sums;
+use `TRY_CAST AS DECIMAL(18,2)` to match pg's `NUMERIC` exactly. Noted
+below as a downstream-user gotcha, not a bug.
+
+### One finding worth filing
+
+Parquet **page-index** MIN/MAX for VARCHAR columns is truncated to 8 bytes
+by the arrow-rs writer defaults. Example for `action_date`:
+
+```
+pyarrow row-group stats:  min='1979-04-15' max='2026-04-01'   (correct)
+duckdb SELECT MIN(action_date):   '1979-04-'                    (8-byte truncated)
+duckdb ORDER BY action_date LIMIT 1: '1979-04-15'               (correct)
+```
+
+Data is fine — row-group Statistics are fine — but the page index the
+truncated values get stored into is what DuckDB's short-circuited
+`MIN()/MAX()` reads. For a string MAX this is an unsafe upper bound
+(`ZZYLVTN9` < true `ZZYLVTN9ZCQ8` lexicographically) which can mis-prune
+row groups under predicate pushdown on VARCHAR range predicates. Fix:
+set `WriterProperties::column_index_truncate_length(None)` (or a larger
+bound) in `pgdump2parquet-arrow/src/lib.rs:40`.
+
 ## Ranked follow-ups (post-smoke-test)
 
 | Priority | Work                                                   | Notes                                            |
 | -------- | ------------------------------------------------------ | ------------------------------------------------ |
-| **P0**   | Smoke-test on USAspending subset                       | Run the 5-step plan above                        |
+| ~~P0~~   | ~~Smoke-test on USAspending subset~~                   | Done 2026-04-18. See above.                      |
+| **P0**   | Disable/extend page-index VARCHAR truncation           | See "One finding worth filing" above             |
 | P1       | PostGIS → GeoParquet via `ST_GeomFromHEXEWKB`          | Filed in `FUTURE.md`. DuckDB backend only.       |
 | P2       | Within-table pipelining (decompress ↔ parse)           | 1.3-1.8× on single-big-table workloads           |
 | P3       | Multi-part output in DuckDB backend (`--parts-rows N`) | Makes `--engine duckdb` safe for 100GB tables    |
-| P4       | `pg_query` fallback DDL parser                         | Only if sqlparser-rs chokes on real-world DDL    |
+| P4       | ~~`pg_query` fallback DDL parser~~                     | Not needed — sqlparser-rs handled real DDL       |
 | P5       | CI + README                                            | Currently zero user-facing docs                  |
 
 `FUTURE.md` in this directory has the PostGIS design sketch and other
