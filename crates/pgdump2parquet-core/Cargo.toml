@@ -9,4 +9,5 @@ publish = false
 
 [dependencies]
 libpgdump = { path = "../.." }
+memchr = "2"
 thiserror = "2"

@@ -10,5 +10,6 @@ publish = false
 [dependencies]
 pgdump2parquet-core = { path = "../pgdump2parquet-core" }
 arrow-array = "53"
+arrow-buffer = "53"
 arrow-schema = "53"
 parquet = { version = "53", default-features = false, features = ["arrow", "zstd", "snap"] }

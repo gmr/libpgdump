@@ -4,15 +4,19 @@
 //!
 //! * A [`ParquetSinkFactory`] that knows how to open a fresh sink per table
 //!   given the table's schema and caller-supplied options.
-//! * A [`ParquetSink`] that accepts parsed rows and, on close, finalises the
-//!   Parquet file and returns statistics.
+//! * A [`ParquetSink`] that accepts parsed blocks and, on close, finalises
+//!   the Parquet file and returns statistics.
 //!
-//! The sink interface is row-at-a-time to keep the contract simple and
-//! allocation-light for the driver; backends that want to batch internally
-//! (arrow row-group buffering, DuckDB appender) do so behind the trait.
+//! The sink interface is **block-at-a-time**: the driver hands the sink a
+//! [`ColumnarBlock`][crate::block::ColumnarBlock] — per-column Arrow-shaped
+//! `(values, offsets, validity)` buffers — and the sink decides how to
+//! incorporate that into its output. Arrow backends can consume the buffers
+//! essentially zero-copy; row-oriented backends (DuckDB Appender) walk the
+//! offsets without going back to per-row allocations.
 
 use std::path::Path;
 
+use crate::block::ColumnarBlock;
 use crate::ddl::ColumnDef;
 
 /// A parsed table schema — exactly what the driver needs to hand to a sink.
@@ -71,11 +75,13 @@ pub trait ParquetSinkFactory: Send + Sync {
 
 /// A per-table sink. One instance per output Parquet file.
 pub trait ParquetSink: Send {
-    /// Append one parsed COPY row. `fields` is exactly the column count
-    /// declared in the schema; `None` = SQL NULL; `Some(bytes)` is the
-    /// decoded field value (not guaranteed UTF-8 — backends that need a
-    /// string should use `String::from_utf8_lossy` or similar).
-    fn append_row(&mut self, fields: &[Option<&[u8]>]) -> Result<(), SinkError>;
+    /// Append a block of rows. Ownership is moved into the sink so it can
+    /// forward the underlying `Vec<u8>` buffers straight into the target
+    /// storage (Arrow `Buffer`s etc.) without an intermediate copy.
+    /// Column order matches the schema passed to [`ParquetSinkFactory::open`].
+    /// For each column, `values[offsets[i]..offsets[i + 1]]` is row `i`'s
+    /// bytes; row `i` is NULL when `validity` is present and bit `i` is clear.
+    fn append_block(&mut self, block: ColumnarBlock) -> Result<(), SinkError>;
 
     /// Flush any buffered rows and finalise the Parquet file.
     fn close(self: Box<Self>) -> Result<SinkStats, SinkError>;

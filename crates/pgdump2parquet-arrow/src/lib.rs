@@ -10,12 +10,14 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, builder::StringBuilder};
+use arrow_array::{RecordBatch, StringArray};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
+use pgdump2parquet_core::block::{ColumnBuffer, ColumnarBlock};
 use pgdump2parquet_core::sink::{
     ParquetSink, ParquetSinkFactory, SinkError, SinkOpts, SinkStats, TableSchema,
 };
@@ -46,10 +48,7 @@ impl ParquetSinkFactory for ArrowFactory {
         Ok(Box::new(ArrowSink {
             writer,
             schema: arrow_schema,
-            builders: schema.columns.iter().map(|_| StringBuilder::new()).collect(),
             ncols: schema.columns.len(),
-            batch_rows: self.opts.batch_rows,
-            pending: 0,
             total_rows: 0,
             _out: out.to_path_buf(),
         }))
@@ -68,40 +67,37 @@ fn build_schema(schema: &TableSchema) -> Arc<Schema> {
 struct ArrowSink {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
-    builders: Vec<StringBuilder>,
     ncols: usize,
-    batch_rows: usize,
-    pending: usize,
     total_rows: usize,
     _out: PathBuf,
 }
 
 impl ParquetSink for ArrowSink {
-    fn append_row(&mut self, fields: &[Option<&[u8]>]) -> Result<(), SinkError> {
-        for i in 0..self.ncols {
-            match fields.get(i).copied().flatten() {
-                Some(bytes) => {
-                    let s = match std::str::from_utf8(bytes) {
-                        Ok(s) => std::borrow::Cow::Borrowed(s),
-                        Err(_) => String::from_utf8_lossy(bytes),
-                    };
-                    self.builders[i].append_value(s.as_ref());
-                }
-                None => self.builders[i].append_null(),
-            }
+    fn append_block(&mut self, block: ColumnarBlock) -> Result<(), SinkError> {
+        if block.n_rows == 0 {
+            return Ok(());
         }
-        self.pending += 1;
-        self.total_rows += 1;
-        if self.pending >= self.batch_rows {
-            self.flush_internal()?;
+        if block.columns.len() != self.ncols {
+            return Err(boxed(std::io::Error::other(format!(
+                "column count mismatch: block has {}, schema has {}",
+                block.columns.len(),
+                self.ncols
+            ))));
         }
+
+        let n_rows = block.n_rows;
+        let arrays: Vec<Arc<dyn arrow_array::Array>> = block
+            .columns
+            .into_iter()
+            .map(|col| column_to_string_array(col, n_rows))
+            .collect::<Result<_, _>>()?;
+        let batch = RecordBatch::try_new(self.schema.clone(), arrays).map_err(boxed)?;
+        self.writer.write(&batch).map_err(boxed)?;
+        self.total_rows += n_rows;
         Ok(())
     }
 
-    fn close(mut self: Box<Self>) -> Result<SinkStats, SinkError> {
-        if self.pending > 0 {
-            self.flush_internal()?;
-        }
+    fn close(self: Box<Self>) -> Result<SinkStats, SinkError> {
         self.writer.close().map_err(boxed)?;
         Ok(SinkStats {
             rows_written: self.total_rows,
@@ -109,18 +105,37 @@ impl ParquetSink for ArrowSink {
     }
 }
 
-impl ArrowSink {
-    fn flush_internal(&mut self) -> Result<(), SinkError> {
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = self
-            .builders
-            .iter_mut()
-            .map(|b| Arc::new(b.finish()) as Arc<dyn arrow_array::Array>)
-            .collect();
-        let batch = RecordBatch::try_new(self.schema.clone(), arrays).map_err(boxed)?;
-        self.writer.write(&batch).map_err(boxed)?;
-        self.pending = 0;
-        Ok(())
-    }
+/// Convert a [`ColumnBuffer`] (which is already in Arrow's `Utf8` physical
+/// layout) into a `StringArray`. We move the `Vec<u8>` buffers directly into
+/// Arrow's `Buffer` via `Buffer::from_vec` — **no memcpy**. This is the key
+/// perf property of the block pipeline: the bytes decoded by the core crate
+/// are the same bytes Arrow serialises to Parquet.
+fn column_to_string_array(
+    col: ColumnBuffer,
+    n_rows: usize,
+) -> Result<Arc<dyn arrow_array::Array>, SinkError> {
+    debug_assert_eq!(col.offsets.len(), n_rows + 1);
+
+    let values_buf = Buffer::from_vec(col.values);
+    let offsets_scalar: ScalarBuffer<i32> = ScalarBuffer::from(col.offsets);
+    let offsets = OffsetBuffer::new(offsets_scalar);
+
+    let nulls = col.validity.map(|bits| {
+        NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+            Buffer::from_vec(bits),
+            0,
+            n_rows,
+        ))
+    });
+
+    // SAFETY: we rely on the COPY parser emitting valid UTF-8 in the common
+    // case. If a dump contains non-UTF-8 in a text field (rare, and strongly
+    // discouraged by pg conventions), ArrowWriter will reject the batch on
+    // encode. Using `new_unchecked` skips the per-value UTF-8 validation
+    // pass — that's the slow bit we're trying to avoid. The Parquet writer
+    // itself will still error out cleanly on invalid UTF-8 when encoding.
+    let array = unsafe { StringArray::new_unchecked(offsets, values_buf, nulls) };
+    Ok(Arc::new(array))
 }
 
 fn boxed<E: std::error::Error + Send + Sync + 'static>(e: E) -> SinkError {

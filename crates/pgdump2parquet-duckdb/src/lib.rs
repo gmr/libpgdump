@@ -19,6 +19,7 @@
 
 use duckdb::{Appender, Connection, appender_params_from_iter};
 
+use pgdump2parquet_core::block::{ColumnBuffer, ColumnarBlock};
 use pgdump2parquet_core::ddl::ColumnDef;
 use pgdump2parquet_core::sink::{
     ParquetSink, ParquetSinkFactory, SinkError, SinkOpts, SinkStats, TableSchema,
@@ -113,13 +114,8 @@ impl ParquetSinkFactory for DuckDbFactory {
             conn,
             cols: schema.columns.clone(),
             out_path: out.to_path_buf(),
-            batch_rows: self.opts.batch_rows,
             row_group_rows: self.opts.row_group_rows,
             zstd_level: self.opts.zstd_level,
-            // Column-major staging: one Vec of `Option<String>` per column.
-            // Keeping values grouped per column lets the appender stream
-            // them down efficiently when we flush.
-            buffered: (0..ncols).map(|_| Vec::with_capacity(8192)).collect(),
             ncols,
             total_rows: 0,
         }))
@@ -174,64 +170,52 @@ struct DuckDbSink {
     cols: Vec<ColumnDef>,
     ncols: usize,
     out_path: std::path::PathBuf,
-    batch_rows: usize,
     row_group_rows: usize,
     zstd_level: i32,
-    /// Column-major row buffer. `buffered[c][r]` is the value for column `c`
-    /// of row `r` within the current batch.
-    buffered: Vec<Vec<Option<String>>>,
     total_rows: usize,
 }
 
-impl DuckDbSink {
-    fn flush_buffer(&mut self) -> Result<(), SinkError> {
-        let rows = self.buffered.first().map(|v| v.len()).unwrap_or(0);
-        if rows == 0 {
+impl ParquetSink for DuckDbSink {
+    fn append_block(&mut self, block: ColumnarBlock) -> Result<(), SinkError> {
+        if block.n_rows == 0 {
             return Ok(());
         }
+        if block.columns.len() != self.ncols {
+            return Err(boxed(std::io::Error::other(format!(
+                "column count mismatch: block has {}, schema has {}",
+                block.columns.len(),
+                self.ncols
+            ))));
+        }
+
+        // Build one column-slice view per column so we can index by row
+        // without allocating per-row Options. `field` returns `Option<&str>`
+        // straight out of the Arrow-shaped buffers. The block owns the
+        // underlying Vecs for the duration of this call.
+        let n_rows = block.n_rows;
+        let views: Vec<ColumnView<'_>> = block
+            .columns
+            .iter()
+            .map(|c| ColumnView::from(c, n_rows))
+            .collect::<Result<_, SinkError>>()?;
+
         let mut app: Appender<'_> = self.conn.appender("_stage").map_err(boxed)?;
-        // Push each buffered row into the appender. We iterate row-first
-        // because that's the Appender's natural shape, reusing a tiny
-        // per-row param vector.
         let mut row_params: Vec<Option<&str>> = Vec::with_capacity(self.ncols);
-        for r in 0..rows {
+        for r in 0..n_rows {
             row_params.clear();
-            for c in 0..self.ncols {
-                row_params.push(self.buffered[c][r].as_deref());
+            for v in &views {
+                row_params.push(v.field(r));
             }
             app.append_row(appender_params_from_iter(row_params.iter()))
                 .map_err(boxed)?;
         }
-        drop(app); // flushes
+        drop(app);
 
-        // Clear buffers but keep capacity for the next batch.
-        for col in &mut self.buffered {
-            col.clear();
-        }
-        Ok(())
-    }
-}
-
-impl ParquetSink for DuckDbSink {
-    fn append_row(&mut self, fields: &[Option<&[u8]>]) -> Result<(), SinkError> {
-        for i in 0..self.ncols {
-            let v = fields.get(i).copied().flatten().map(|bytes| {
-                match std::str::from_utf8(bytes) {
-                    Ok(s) => s.to_string(),
-                    Err(_) => String::from_utf8_lossy(bytes).into_owned(),
-                }
-            });
-            self.buffered[i].push(v);
-        }
-        self.total_rows += 1;
-        if self.buffered[0].len() >= self.batch_rows {
-            self.flush_buffer()?;
-        }
+        self.total_rows += n_rows;
         Ok(())
     }
 
-    fn close(mut self: Box<Self>) -> Result<SinkStats, SinkError> {
-        self.flush_buffer()?;
+    fn close(self: Box<Self>) -> Result<SinkStats, SinkError> {
         let select_list = self
             .cols
             .iter()
@@ -264,6 +248,81 @@ impl ParquetSink for DuckDbSink {
         })
     }
 }
+
+/// Zero-allocation row access over a block column. Resolves NULLs via the
+/// packed validity bitmap and slices into the Arrow-shaped values buffer
+/// using the offsets array. UTF-8 validation is done per-value by the
+/// DuckDB appender's binding layer, so we pass raw `&str` where we can;
+/// non-UTF-8 bytes fall back to a lossy conversion cached for the lifetime
+/// of the column view.
+struct ColumnView<'a> {
+    n_rows: usize,
+    values: &'a [u8],
+    offsets: &'a [i32],
+    validity: Option<&'a [u8]>,
+    /// Lazily populated when a non-UTF-8 value is encountered.
+    owned_strings: std::cell::UnsafeCell<Vec<Option<String>>>,
+}
+
+impl<'a> ColumnView<'a> {
+    fn from(col: &'a ColumnBuffer, n_rows: usize) -> Result<Self, SinkError> {
+        if col.offsets.len() != n_rows + 1 {
+            return Err(boxed(std::io::Error::other(format!(
+                "offsets length {} != n_rows+1 ({})",
+                col.offsets.len(),
+                n_rows + 1
+            ))));
+        }
+        Ok(ColumnView {
+            n_rows,
+            values: &col.values,
+            offsets: &col.offsets,
+            validity: col.validity.as_deref(),
+            owned_strings: std::cell::UnsafeCell::new(Vec::new()),
+        })
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self.validity {
+            None => false,
+            Some(bits) => bits[row / 8] & (1u8 << (row % 8)) == 0,
+        }
+    }
+
+    fn field(&self, row: usize) -> Option<&str> {
+        if row >= self.n_rows || self.is_null(row) {
+            return None;
+        }
+        let start = self.offsets[row] as usize;
+        let end = self.offsets[row + 1] as usize;
+        let bytes = &self.values[start..end];
+        match std::str::from_utf8(bytes) {
+            Ok(s) => Some(s),
+            Err(_) => {
+                // Lazily materialise a lossy owned copy for this row.
+                // SAFETY: we never hand out two mutable refs to the Vec
+                // (`UnsafeCell` is only touched here, and the returned
+                // reference is to a string inside it that is never removed).
+                unsafe {
+                    let v = &mut *self.owned_strings.get();
+                    if v.len() < self.n_rows {
+                        v.resize(self.n_rows, None);
+                    }
+                    if v[row].is_none() {
+                        v[row] = Some(String::from_utf8_lossy(bytes).into_owned());
+                    }
+                    v[row].as_deref()
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: the `UnsafeCell` is only mutated from `&self` in a way that
+// never produces overlapping borrows (each `field` call returns a borrow
+// into a stable slot). The sink is also `!Sync` in practice because it
+// holds a DuckDB `Connection` that isn't Sync; we assert Send only.
+unsafe impl Send for ColumnView<'_> {}
 
 fn quote_ident(s: &str) -> String {
     let escaped = s.replace('"', "\"\"");

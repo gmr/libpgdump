@@ -354,7 +354,12 @@ fn worker_loop(
         let mut sink = factory
             .open(&tmp, &schema)
             .map_err(|e| anyhow::anyhow!("opening sink for {}.{}: {e}", job.namespace, job.tag))?;
-        let rows = drive_table(&mut reader, job.dump_id, sink.as_mut())?;
+        let rows = drive_table(
+            &mut reader,
+            job.dump_id,
+            schema.columns.len(),
+            sink.as_mut(),
+        )?;
         let _stats = sink
             .close()
             .map_err(|e| anyhow::anyhow!("closing sink for {}.{}: {e}", job.namespace, job.tag))?;

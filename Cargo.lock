@@ -1208,6 +1208,7 @@ name = "pgdump2parquet-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow-array 53.4.1",
+ "arrow-buffer 53.4.1",
  "arrow-schema 53.4.1",
  "parquet",
  "pgdump2parquet-core",
@@ -1218,6 +1219,7 @@ name = "pgdump2parquet-core"
 version = "0.1.0"
 dependencies = [
  "libpgdump",
+ "memchr",
  "thiserror",
 ]
 

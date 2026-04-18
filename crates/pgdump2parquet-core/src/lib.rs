@@ -13,26 +13,35 @@
 //! DATA entry from a [`libpgdump::format::custom::CustomReader`] into a
 //! caller-supplied sink.
 
+pub mod block;
 pub mod copy_text;
 pub mod ddl;
 pub mod sink;
 
-use std::io::{BufRead, BufReader, Read, Seek};
+use std::io::{Read, Seek};
 
 use libpgdump::format::custom::CustomReader;
 
+pub use block::{BlockFrame, BlockReader, ColumnBuffer, ColumnarBlock, FieldRanges};
 pub use sink::{ParquetSink, ParquetSinkFactory, SinkOpts, SinkStats, TableSchema};
 
 /// Stream one TABLE DATA entry into `sink`. Returns the row count written.
 ///
-/// The sink is driven row-by-row via [`ParquetSink::append_row`]; the caller
-/// is responsible for calling [`ParquetSink::close`] once they've decided the
-/// output is complete (this function does not close, so the caller can add
-/// its own bookkeeping — atomic rename, `.done` marker, etc. — before
-/// finalising).
+/// The sink is driven **block-at-a-time**: a [`BlockReader`] frames rows out
+/// of the decompressed stream into a reusable arena, fields are split with
+/// vectorised `memchr`, and per-column buffers (Arrow-shaped) are handed to
+/// [`ParquetSink::append_block`]. Columns whose fields contain no backslash
+/// escapes skip the decode pass entirely — their values are copied straight
+/// from the arena. The caller is still responsible for calling
+/// [`ParquetSink::close`] after the final block.
+///
+/// `n_cols` is the declared column count for the table. Rows with fewer
+/// fields are padded with NULLs; rows with more have their extras discarded
+/// (pg_dump output is rectangular in practice, but the driver is defensive).
 pub fn drive_table<R: Read + Seek, S: ParquetSink + ?Sized>(
     reader: &mut CustomReader<R>,
     dump_id: i32,
+    n_cols: usize,
     sink: &mut S,
 ) -> Result<usize, DriveError> {
     let Some(stream) = reader
@@ -41,34 +50,31 @@ pub fn drive_table<R: Read + Seek, S: ParquetSink + ?Sized>(
     else {
         return Ok(0);
     };
-    let mut lines = BufReader::new(stream);
-    let mut line: Vec<u8> = Vec::new();
+
+    // 4MB blocks by default — big enough that parquet writers don't see
+    // excessive tiny RecordBatches, small enough that peak arena stays a
+    // few MB per worker.
+    const BLOCK_TARGET: usize = 4 * 1024 * 1024;
+    let mut br = BlockReader::new(stream, BLOCK_TARGET);
+    let mut ranges = FieldRanges::new();
     let mut rows = 0usize;
 
-    loop {
-        line.clear();
-        let n = lines.read_until(b'\n', &mut line).map_err(DriveError::Io)?;
-        if n == 0 {
+    while let Some(frame) = br.next_block().map_err(DriveError::Io)? {
+        let eod = frame.eod;
+        if frame.row_offsets.len() > 1 {
+            ranges.fill(&frame, n_cols);
+            rows += ranges.n_rows;
+            let block = ColumnarBlock::build(&frame, &ranges);
+            // `block` owns its buffers; the `frame` borrow can be released
+            // here so the sink isn't limited by it.
+            let _ = frame;
+            sink.append_block(block).map_err(DriveError::Sink)?;
+        }
+        if eod {
             break;
         }
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.is_empty() {
-            continue;
-        }
-        if line == b"\\." {
-            break;
-        }
-        let parsed = copy_text::parse_line(&line);
-        // Convert to borrowed slices for the sink interface.
-        let refs: Vec<Option<&[u8]>> = parsed.iter().map(|f| f.as_deref()).collect();
-        sink.append_row(&refs).map_err(DriveError::Sink)?;
-        rows += 1;
     }
+
     Ok(rows)
 }
 
