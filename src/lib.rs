@@ -1,9 +1,5 @@
 pub mod compress;
 pub mod constants;
-pub mod copy_text;
-pub mod ddl;
-#[cfg(feature = "cli-duckdb")]
-pub mod duckdb_export;
 pub mod dump;
 pub mod entry;
 pub mod error;

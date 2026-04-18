@@ -1,0 +1,28 @@
+[package]
+name = "pgdump2parquet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "CLI: convert a pg_dump custom-format archive directly to Parquet files, one per table, without going through Postgres."
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+libpgdump = { path = "../.." }
+pgdump2parquet-core = { path = "../pgdump2parquet-core" }
+pgdump2parquet-arrow = { path = "../pgdump2parquet-arrow" }
+# Optional: embed DuckDB. Compile-time expensive (~5min clean build) but
+# produces a standalone binary with no runtime DuckDB dependency.
+pgdump2parquet-duckdb = { path = "../pgdump2parquet-duckdb", optional = true }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[features]
+default = []
+# Enables the `--engine duckdb` code path. Without this feature, selecting
+# that engine at runtime exits with an error message.
+duckdb = ["dep:pgdump2parquet-duckdb"]
+
+[[bin]]
+name = "pgdump2parquet"
+path = "src/main.rs"

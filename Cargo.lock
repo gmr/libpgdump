@@ -1003,14 +1003,8 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 name = "libpgdump"
 version = "2.1.0"
 dependencies = [
- "anyhow",
- "arrow-array 53.4.1",
- "arrow-schema 53.4.1",
- "clap",
- "duckdb",
  "flate2",
  "lz4_flex",
- "parquet",
  "pretty_assertions",
  "tempfile",
  "thiserror",
@@ -1196,6 +1190,44 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pgdump2parquet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libpgdump",
+ "pgdump2parquet-arrow",
+ "pgdump2parquet-core",
+ "pgdump2parquet-duckdb",
+]
+
+[[package]]
+name = "pgdump2parquet-arrow"
+version = "0.1.0"
+dependencies = [
+ "arrow-array 53.4.1",
+ "arrow-schema 53.4.1",
+ "parquet",
+ "pgdump2parquet-core",
+]
+
+[[package]]
+name = "pgdump2parquet-core"
+version = "0.1.0"
+dependencies = [
+ "libpgdump",
+ "thiserror",
+]
+
+[[package]]
+name = "pgdump2parquet-duckdb"
+version = "0.1.0"
+dependencies = [
+ "duckdb",
+ "pgdump2parquet-core",
+]
 
 [[package]]
 name = "pkg-config"

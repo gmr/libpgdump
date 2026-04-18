@@ -1,0 +1,14 @@
+[package]
+name = "pgdump2parquet-arrow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Arrow-rs + parquet-crate ParquetSink implementation for pgdump2parquet."
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+pgdump2parquet-core = { path = "../pgdump2parquet-core" }
+arrow-array = "53"
+arrow-schema = "53"
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd", "snap"] }

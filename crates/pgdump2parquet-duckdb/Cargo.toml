@@ -1,0 +1,15 @@
+[package]
+name = "pgdump2parquet-duckdb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Embedded-DuckDB ParquetSink implementation for pgdump2parquet."
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+pgdump2parquet-core = { path = "../pgdump2parquet-core" }
+# Bundled libduckdb plus the `parquet` and `json` extensions so the binary
+# is fully self-contained and doesn't attempt an at-runtime extension
+# download (which fails on airgapped / sandboxed hosts).
+duckdb = { version = "1", features = ["bundled", "parquet", "json"] }

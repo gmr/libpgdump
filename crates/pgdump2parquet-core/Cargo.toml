@@ -1,0 +1,12 @@
+[package]
+name = "pgdump2parquet-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Backend-agnostic core for converting pg_dump archives to Parquet: COPY-TEXT and CREATE-TABLE parsers, sink trait, per-table driver."
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+libpgdump = { path = "../.." }
+thiserror = "2"
