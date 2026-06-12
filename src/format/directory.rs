@@ -20,7 +20,7 @@ const MAGIC: &[u8; 5] = b"PGDMP";
 
 /// Read a directory format dump from the given path.
 pub fn read_dump(dir: &Path) -> Result<Dump> {
-    let toc = read_metadata(dir)?;
+    let toc = read_toc(dir)?;
 
     // Read data files and blobs from the directory
     let (data, blobs) = read_data_files(dir, &toc.entries)?;
@@ -28,8 +28,9 @@ pub fn read_dump(dir: &Path) -> Result<Dump> {
     Ok(Dump { toc, data, blobs })
 }
 
-/// Read only archive metadata (header and TOC) from a directory archive.
-pub fn read_metadata(dir: &Path) -> Result<TableOfContents> {
+/// Read only the [TableOfContents] of a directory format dump, without
+/// loading data files.
+pub fn read_toc(dir: &Path) -> Result<TableOfContents> {
     let toc_path = dir.join("toc.dat");
     if !toc_path.exists() {
         return Err(Error::InvalidHeader(format!(
@@ -39,13 +40,13 @@ pub fn read_metadata(dir: &Path) -> Result<TableOfContents> {
     }
 
     let toc_data = fs::read(&toc_path)?;
-    read_toc_data(&toc_data, Format::Directory)
+    read_toc_bytes(&toc_data, Format::Directory)
 }
 
-pub(crate) fn read_toc_data(toc_data: &[u8], format: Format) -> Result<TableOfContents> {
+pub(crate) fn read_toc_bytes(toc_data: &[u8], format: Format) -> Result<TableOfContents> {
     let mut r = Cursor::new(toc_data);
 
-    let toc = read_toc(&mut r)?;
+    let toc = parse_toc(&mut r)?;
 
     // toc.dat stores archTar(3), override to caller format.
     Ok(TableOfContents { format, ..toc })
@@ -87,7 +88,7 @@ pub fn write_dump(dir: &Path, dump: &Dump) -> Result<()> {
 
 // -- Table of Contents reading/writing --
 
-fn read_toc<R: Read>(r: &mut R) -> Result<TableOfContents> {
+fn parse_toc<R: Read>(r: &mut R) -> Result<TableOfContents> {
     let mut magic = [0u8; 5];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
