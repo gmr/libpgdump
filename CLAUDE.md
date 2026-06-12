@@ -25,19 +25,19 @@ The public API is `Dump::load(path)` / `Dump::save(path)` in `src/dump.rs`. `loa
 
 ### Format readers/writers
 
-Each format has its own `read_archive` / `write_archive` in `src/format/`:
+Each format has its own `read_dump` / `write_dump` in `src/format/`:
 - `custom.rs` — Custom format (Fc), binary stream with TOC + data blocks
 - `directory.rs` — Directory format (Fd), `toc.dat` file + per-entry `.dat` files
 - `tar.rs` — Tar format (Ft), standard tar archive with `toc.dat` + data files
 
-All three share the `ArchiveData` intermediate struct (defined in `custom.rs`) that `Dump` converts to/from.
+All three format modules read/write the same in-memory shape as `Dump` (`toc`, `data`, `blobs`).
 
 ### Core modules
 
-- `src/io/primitives.rs` — Low-level read/write for pg_dump's custom integer, string, and offset encodings
+- `src/io/primitives.rs` — Low-level read/write for pg_dump's custom integer, string, offset, and timestamp encodings
 - `src/compress/` — Compression layer (none, gzip, lz4, zstd) with `decompressor`/`compressor` factory functions
 - `src/entry.rs` — TOC entry model
-- `src/header.rs` — Archive header model
+- `src/toc.rs` — Archive header and TOC model
 - `src/types.rs` — Core enums: `ObjectType` (50+ pg_dump object types with `section()`, `priority()`, `as_str()`), `Section`, `Format`, `CompressionAlgorithm`, etc.
 - `src/sort.rs` — Weighted topological sort of TOC entries, matching pg_dump's `pg_dump_sort.c`
 - `src/constants.rs` — Archive magic bytes (`PGDMP`)

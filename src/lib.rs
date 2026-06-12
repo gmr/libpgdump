@@ -1,12 +1,11 @@
 pub mod compress;
-pub mod constants;
 pub mod dump;
 pub mod entry;
 pub mod error;
 pub mod format;
-pub mod header;
 pub mod io;
 mod sort;
+pub mod toc;
 pub mod types;
 pub mod version;
 
@@ -15,13 +14,10 @@ use std::path::Path;
 pub use dump::Dump;
 pub use entry::Entry;
 pub use error::{Error, Result};
-pub use format::custom::{
-    CompressedEntryReader, CustomReader, EntryData, EntryReader, RawEntryReader,
-};
-pub use header::Header;
+pub use format::custom::{CustomDataLoader, EntryData};
+pub use toc::TableOfContents;
 pub use types::{
-    ArchiveData, Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section,
-    Timestamp,
+    Blob, BlockType, CompressionAlgorithm, Format, ObjectType, OffsetState, Section, Timestamp,
 };
 pub use version::ArchiveVersion;
 

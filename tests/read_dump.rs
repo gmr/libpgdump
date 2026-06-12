@@ -9,23 +9,25 @@ fn test_load_uncompressed() {
     };
     let dump = libpgdump::load(&path).expect("failed to load uncompressed dump");
 
-    assert!(!dump.dbname().is_empty());
-    assert!(!dump.server_version().is_empty());
-    assert!(!dump.dump_version().is_empty());
-    assert!(!dump.entries().is_empty());
+    assert!(!dump.toc.dbname.is_empty());
+    assert!(!dump.toc.server_version.is_empty());
+    assert!(!dump.toc.dump_version.is_empty());
+    assert!(!dump.toc.entries.is_empty());
 
-    assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::None);
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::None);
 
     // Should have ENCODING, STDSTRINGS, SEARCHPATH entries
     let has_encoding = dump
-        .entries()
+        .toc
+        .entries
         .iter()
         .any(|e| e.desc == libpgdump::ObjectType::Encoding);
     assert!(has_encoding, "dump should have an ENCODING entry");
 
     // Check that there are TABLE DATA entries
     let table_data_count = dump
-        .entries()
+        .toc
+        .entries
         .iter()
         .filter(|e| e.desc == libpgdump::ObjectType::TableData)
         .count();
@@ -40,13 +42,14 @@ fn test_load_compressed() {
     };
     let dump = libpgdump::load(&path).expect("failed to load compressed dump");
 
-    assert!(!dump.dbname().is_empty());
-    assert!(!dump.entries().is_empty());
-    assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::Gzip);
+    assert!(!dump.toc.dbname.is_empty());
+    assert!(!dump.toc.entries.is_empty());
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::Gzip);
 
     // TABLE DATA entries should exist and have data
     let table_data_count = dump
-        .entries()
+        .toc
+        .entries
         .iter()
         .filter(|e| e.desc == libpgdump::ObjectType::TableData)
         .count();
@@ -64,10 +67,10 @@ fn test_load_schema_only() {
     };
     let dump = libpgdump::load(&path).expect("failed to load schema-only dump");
 
-    assert!(!dump.entries().is_empty());
+    assert!(!dump.toc.entries.is_empty());
 
     // TABLE DATA entries should exist but have no data
-    for entry in dump.entries() {
+    for entry in &dump.toc.entries {
         if entry.desc == libpgdump::ObjectType::TableData {
             assert!(
                 !entry.had_dumper,
@@ -84,7 +87,7 @@ fn test_load_data_only() {
         return;
     };
     let dump = libpgdump::load(&path).expect("failed to load data-only dump");
-    assert!(!dump.entries().is_empty());
+    assert!(!dump.toc.entries.is_empty());
 }
 
 #[test]
@@ -165,7 +168,7 @@ fn test_entry_sections() {
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
     use libpgdump::ObjectType;
-    for entry in dump.entries() {
+    for entry in &dump.toc.entries {
         match entry.desc {
             ObjectType::Table => assert_eq!(entry.section, libpgdump::Section::PreData),
             ObjectType::TableData => assert_eq!(entry.section, libpgdump::Section::Data),
@@ -185,7 +188,7 @@ fn test_entry_dependencies() {
     let dump = libpgdump::load(&path).expect("failed to load dump");
 
     // TABLE DATA entries typically depend on their TABLE entry
-    let has_deps = dump.entries().iter().any(|e| !e.dependencies.is_empty());
+    let has_deps = dump.toc.entries.iter().any(|e| !e.dependencies.is_empty());
     assert!(has_deps, "some entries should have dependencies");
 }
 
@@ -197,13 +200,14 @@ fn test_load_directory() {
     };
     let dump = libpgdump::load(&path).expect("failed to load directory dump");
 
-    assert!(!dump.dbname().is_empty());
-    assert!(!dump.server_version().is_empty());
-    assert!(!dump.entries().is_empty());
-    assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::None);
+    assert!(!dump.toc.dbname.is_empty());
+    assert!(!dump.toc.server_version.is_empty());
+    assert!(!dump.toc.entries.is_empty());
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::None);
 
     let table_data_count = dump
-        .entries()
+        .toc
+        .entries
         .iter()
         .filter(|e| e.desc == libpgdump::ObjectType::TableData)
         .count();
@@ -221,9 +225,9 @@ fn test_load_directory_compressed() {
     };
     let dump = libpgdump::load(&path).expect("failed to load compressed directory dump");
 
-    assert!(!dump.dbname().is_empty());
-    assert!(!dump.entries().is_empty());
-    assert_eq!(dump.compression(), libpgdump::CompressionAlgorithm::Gzip);
+    assert!(!dump.toc.dbname.is_empty());
+    assert!(!dump.toc.entries.is_empty());
+    assert_eq!(dump.toc.compression, libpgdump::CompressionAlgorithm::Gzip);
 
     let rows: Vec<&str> = dump
         .table_data("public", "pgbench_accounts")
