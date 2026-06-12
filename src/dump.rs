@@ -5,12 +5,14 @@ use std::path::Path;
 
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-use crate::format::custom::{self, ArchiveData, Blob, Timestamp};
+use crate::format::custom;
 use crate::format::directory;
 use crate::format::tar;
 use crate::header::Header;
 use crate::sort;
-use crate::types::{CompressionAlgorithm, Format, ObjectType, OffsetState};
+use crate::types::{
+    ArchiveData, Blob, CompressionAlgorithm, Format, ObjectType, OffsetState, Timestamp,
+};
 use crate::version::{self, ArchiveVersion};
 
 /// A PostgreSQL dump archive.
