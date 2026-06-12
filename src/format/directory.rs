@@ -7,6 +7,7 @@ use crate::compress;
 use crate::constants::MAGIC;
 use crate::entry::Entry;
 use crate::error::{Error, Result};
+use crate::format::ArchiveMetadata;
 use crate::format::custom::{ArchiveData, Blob, Timestamp};
 use crate::header::Header;
 use crate::io::primitives::{
@@ -18,6 +19,25 @@ use flate2::read::GzDecoder;
 
 /// Read a directory format archive from the given path.
 pub fn read_archive(dir: &Path) -> Result<ArchiveData> {
+    let metadata = read_metadata(dir)?;
+
+    // Read data files and blobs from the directory
+    let (data, blobs) = read_data_files(dir, &metadata.header, &metadata.entries)?;
+
+    Ok(ArchiveData {
+        header: metadata.header,
+        timestamp: metadata.timestamp,
+        dbname: metadata.dbname,
+        server_version: metadata.server_version,
+        dump_version: metadata.dump_version,
+        entries: metadata.entries,
+        data,
+        blobs,
+    })
+}
+
+/// Read only archive metadata (header and TOC) from a directory archive.
+pub fn read_metadata(dir: &Path) -> Result<ArchiveMetadata> {
     let toc_path = dir.join("toc.dat");
     if !toc_path.exists() {
         return Err(Error::InvalidHeader(format!(
@@ -27,7 +47,11 @@ pub fn read_archive(dir: &Path) -> Result<ArchiveData> {
     }
 
     let toc_data = fs::read(&toc_path)?;
-    let mut r = Cursor::new(&toc_data);
+    read_toc_data(&toc_data, Format::Directory)
+}
+
+pub(crate) fn read_toc_data(toc_data: &[u8], format: Format) -> Result<ArchiveMetadata> {
+    let mut r = Cursor::new(toc_data);
 
     let header = read_header(&mut r)?;
     let int_size = header.int_size;
@@ -49,24 +73,14 @@ pub fn read_archive(dir: &Path) -> Result<ArchiveData> {
         entries.push(read_entry(&mut r, &header)?);
     }
 
-    // Read data files and blobs from the directory
-    let (data, blobs) = read_data_files(dir, &header, &entries)?;
-
-    // Fix the header format — toc.dat stores archTar(3) but we're reading as directory
-    let header = Header {
-        format: Format::Directory,
-        ..header
-    };
-
-    Ok(ArchiveData {
-        header,
+    Ok(ArchiveMetadata {
+        // toc.dat stores archTar(3), override to caller format.
+        header: Header { format, ..header },
         timestamp,
         dbname,
         server_version,
         dump_version,
         entries,
-        data,
-        blobs,
     })
 }
 

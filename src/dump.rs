@@ -36,17 +36,17 @@ impl Dump {
     /// - File with ustar header → tar format (`-Ft`)
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let archive = if path.is_dir() {
-            directory::read_archive(path)?
-        } else {
-            match detect_file_format(path)? {
-                Format::Tar => tar::read_archive(path)?,
-                _ => {
-                    let file = File::open(path)?;
-                    let mut reader = BufReader::new(file);
-                    custom::read_archive(&mut reader)?
-                }
+        let archive = match detect_file_format(path)? {
+            Format::Tar => tar::read_archive(path)?,
+            Format::Directory => directory::read_archive(path)?,
+            Format::Custom => {
+                let file = File::open(path)?;
+                let mut reader = BufReader::new(file);
+                custom::read_archive(&mut reader)?
             }
+            Format::Files => unreachable!(),
+            Format::Null => unreachable!(),
+            Format::Unknown => unreachable!(),
         };
         Ok(Self::from_archive_data(archive))
     }
@@ -427,10 +427,13 @@ impl Dump {
         sort::sort_entries(&mut self.entries);
     }
 }
-
-/// Detect file format by reading magic bytes.
+/// Directories are always treated as directory format.
+/// For files, detect file format by reading magic bytes.
 /// Custom format starts with "PGDMP"; tar has "ustar" at offset 257.
-fn detect_file_format(path: &Path) -> Result<Format> {
+pub fn detect_file_format(path: &Path) -> Result<Format> {
+    if path.is_dir() {
+        return Ok(Format::Directory);
+    }
     use std::io::Read;
 
     let mut file = File::open(path)?;
