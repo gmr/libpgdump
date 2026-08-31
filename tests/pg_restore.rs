@@ -21,6 +21,34 @@ fn pg_restore(args: &[&str]) -> Option<std::process::Output> {
     }
 }
 
+/// The major version of the pg_restore on PATH, or `None` if it is missing.
+fn pg_restore_major_version() -> Option<u32> {
+    let output = pg_restore(&["--version"])?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // "pg_restore (PostgreSQL) 16.4 (Debian 16.4-1.pgdg120+1)"
+    let version = text.split_whitespace().nth(2)?;
+    version.split(['.', 'a', 'b', 'r']).next()?.parse().ok()
+}
+
+/// The compression algorithms the pg_restore on PATH can actually read.
+///
+/// lz4 and zstd arrived in PostgreSQL 16, together with archive version 1.15,
+/// which carries the compression-algorithm byte they need. Older pg_restore
+/// rejects such an archive outright with "unsupported version (1.15)", so
+/// there is nothing to assert for them before 16.
+fn restorable_compression() -> Vec<CompressionAlgorithm> {
+    let mut algorithms = vec![CompressionAlgorithm::Gzip];
+    match pg_restore_major_version() {
+        Some(major) if major >= 16 => {
+            algorithms.push(CompressionAlgorithm::Lz4);
+            algorithms.push(CompressionAlgorithm::Zstd);
+        }
+        Some(major) => eprintln!("skipping lz4 and zstd: pg_restore {major} cannot read them"),
+        None => eprintln!("skipping: pg_restore not found"),
+    }
+    algorithms
+}
+
 /// Assert that pg_restore can read the whole archive, TOC and data alike.
 ///
 /// `pg_restore -l` only parses the TOC, so this converts to SQL instead to
@@ -110,11 +138,7 @@ fn test_pg_restore_reads_compressed_custom() {
     let Some(path) = bootstrap_fixture("dump.not-compressed") else {
         return;
     };
-    for compression in [
-        CompressionAlgorithm::Gzip,
-        CompressionAlgorithm::Lz4,
-        CompressionAlgorithm::Zstd,
-    ] {
+    for compression in restorable_compression() {
         round_trip_through_pg_restore(&path, Format::Custom, compression, "out.dump");
     }
 }
@@ -124,11 +148,7 @@ fn test_pg_restore_reads_compressed_directory() {
     let Some(path) = bootstrap_fixture("dump.directory") else {
         return;
     };
-    for compression in [
-        CompressionAlgorithm::Gzip,
-        CompressionAlgorithm::Lz4,
-        CompressionAlgorithm::Zstd,
-    ] {
+    for compression in restorable_compression() {
         round_trip_through_pg_restore(&path, Format::Directory, compression, "out.dir");
     }
 }
@@ -157,15 +177,12 @@ fn test_pg_restore_reads_legacy_archives() {
 
 /// Regression test: compressing an archive older than 1.15 used to fail,
 /// because those versions have no compression-algorithm byte. Unlike the
-/// `bootstrap_fixture` cases, this runs on every matrix version, since the
-/// source archive is checked in rather than written by the local pg_dump.
+/// `bootstrap_fixture` cases, the source archive is checked in rather than
+/// written by the local pg_dump, so the pre-1.15 path is exercised on every
+/// matrix version instead of only where pg_dump happens to write 1.14.
 #[test]
 fn test_pg_restore_reads_compressed_legacy_archive() {
-    for compression in [
-        CompressionAlgorithm::Gzip,
-        CompressionAlgorithm::Lz4,
-        CompressionAlgorithm::Zstd,
-    ] {
+    for compression in restorable_compression() {
         for (format, out_name) in [(Format::Custom, "out.dump"), (Format::Directory, "out.dir")] {
             round_trip_through_pg_restore(
                 &data_path("pg13-archive-1.14.dump"),
