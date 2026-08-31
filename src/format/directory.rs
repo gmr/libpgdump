@@ -440,8 +440,10 @@ fn write_entry<W: Write>(w: &mut W, entry: &Entry, header: &Header) -> Result<()
         write_string(w, None, int_size)?;
     }
 
-    // Directory format extra TOC data: filename
-    write_string(w, entry.filename.as_deref(), int_size)?;
+    // Directory format extra TOC data: filename. pg_restore's _ReadExtraToc
+    // calls strlen() on this value, so entries with no data file must write an
+    // empty string, not NULL.
+    write_string(w, Some(entry.filename.as_deref().unwrap_or("")), int_size)?;
 
     Ok(())
 }
