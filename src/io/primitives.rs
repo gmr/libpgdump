@@ -49,11 +49,17 @@ pub fn write_int<W: Write>(w: &mut W, value: i32, int_size: u8) -> Result<()> {
 
 /// Read a pg_dump length-prefixed string.
 ///
-/// Returns `None` for length <= 0 (NULL strings use -1, but we treat 0 the same).
+/// Returns `None` for a NULL string (length -1) and `Some("")` for an empty
+/// one (length 0). pg_dump writes empty strings for fields such as an entry's
+/// owner, and pg_restore before PostgreSQL 12 calls `strlen()` on them without
+/// a NULL check, so the two cases must stay distinct on the way back out.
 pub fn read_string<R: Read>(r: &mut R, int_size: u8) -> Result<Option<String>> {
     let len = read_int(r, int_size)?;
-    if len <= 0 {
+    if len < 0 {
         return Ok(None);
+    }
+    if len == 0 {
+        return Ok(Some(String::new()));
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
@@ -203,8 +209,11 @@ mod tests {
     fn test_read_write_string_empty() {
         let mut buf = Vec::new();
         write_string(&mut buf, Some(""), 4).unwrap();
-        // Empty string writes length 0, which reads back as None
-        assert_eq!(read_string(&mut Cursor::new(&buf), 4).unwrap(), None);
+        // An empty string is distinct from NULL and must survive the round trip
+        assert_eq!(
+            read_string(&mut Cursor::new(&buf), 4).unwrap(),
+            Some(String::new())
+        );
     }
 
     #[test]

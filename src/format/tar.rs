@@ -1,7 +1,8 @@
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::format::ArchiveMetadata;
 use crate::format::directory;
 use crate::header::Header;
 use crate::types::{ArchiveData, CompressionAlgorithm, Format};
@@ -47,6 +48,51 @@ pub fn read_archive(path: &Path) -> Result<ArchiveData> {
     };
 
     Ok(archive)
+}
+
+/// Read the archive header and TOC of a tar archive without loading data.
+///
+/// pg_dump writes `toc.dat` as the first member, so this seeks past the data
+/// members instead of buffering the whole archive.
+pub fn read_metadata(path: &Path) -> Result<ArchiveMetadata> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut header = [0u8; TAR_BLOCK_SIZE];
+
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(Error::Io(err)),
+        }
+
+        // Two consecutive null blocks = end of archive
+        if header.iter().all(|&b| b == 0) {
+            break;
+        }
+
+        let name = parse_tar_name(&header);
+        if name.is_empty() {
+            break;
+        }
+
+        let size = parse_tar_size(&header)?;
+        if name == "toc.dat" {
+            let mut toc_data = vec![0u8; size];
+            reader.read_exact(&mut toc_data)?;
+            return directory::read_toc_data(&toc_data, Format::Tar);
+        }
+
+        // Skip the data and its padding to the next 512-byte boundary
+        let padding = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
+        let skip = i64::try_from(size + padding)
+            .map_err(|_| Error::DataIntegrity(format!("tar member '{name}' is too large")))?;
+        reader.seek_relative(skip)?;
+    }
+
+    Err(Error::InvalidHeader(format!(
+        "toc.dat not found in {}",
+        path.display()
+    )))
 }
 
 /// Write a tar format archive to the given path.
@@ -333,6 +379,13 @@ mod tests {
         assert_eq!(parsed.dbname, "testdb");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.data.get(&1).unwrap(), data_content);
+
+        // The TOC is also readable without loading the data members
+        let metadata = read_metadata(tmp.path()).unwrap();
+        assert_eq!(metadata.dbname, "testdb");
+        assert_eq!(metadata.header.format, Format::Tar);
+        assert_eq!(metadata.entries.len(), 1);
+        assert_eq!(metadata.entries[0].tag.as_deref(), Some("users"));
     }
 
     #[test]
