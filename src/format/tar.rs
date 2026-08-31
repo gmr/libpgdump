@@ -79,17 +79,28 @@ pub fn write_archive(path: &Path, archive: &ArchiveData) -> Result<()> {
     let toc_data = std::fs::read(tmp.path().join("toc.dat"))?;
     write_tar_member(&mut writer, "toc.dat", &toc_data)?;
 
-    // Add data files and blob files
-    let mut dir_entries: Vec<_> = std::fs::read_dir(tmp.path())?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name() != "toc.dat")
-        .collect();
-    dir_entries.sort_by_key(|e| e.file_name());
+    // Add data files and blob files in TOC entry order. pg_restore reads tar
+    // archives sequentially and fails if a data member comes before the member
+    // of an earlier TOC entry. Tar archives are never compressed, so the
+    // filenames have no compression suffix.
+    for entry in &archive.entries {
+        if archive.data.contains_key(&entry.dump_id) {
+            let name = format!("{}.dat", entry.dump_id);
+            let data = std::fs::read(tmp.path().join(&name))?;
+            write_tar_member(&mut writer, &name, &data)?;
+        }
 
-    for dir_entry in &dir_entries {
-        let name = dir_entry.file_name().to_string_lossy().to_string();
-        let data = std::fs::read(dir_entry.path())?;
-        write_tar_member(&mut writer, &name, &data)?;
+        if let Some(blobs) = archive.blobs.get(&entry.dump_id) {
+            let toc_name = directory::blob_toc_filename(entry)?;
+            let toc_data = std::fs::read(tmp.path().join(&toc_name))?;
+            write_tar_member(&mut writer, &toc_name, &toc_data)?;
+
+            for blob in blobs {
+                let name = format!("blob_{}.dat", blob.oid);
+                let data = std::fs::read(tmp.path().join(&name))?;
+                write_tar_member(&mut writer, &name, &data)?;
+            }
+        }
     }
 
     // Write restore.sql placeholder

@@ -63,6 +63,10 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get update
           sudo apt-get install -y postgresql-client-${{ matrix.postgres }}
+          # /usr/bin/pg_restore is pg_wrapper, which picks the version of the
+          # default cluster rather than the newest client. Put the matrix
+          # version's binaries first so pg_restore matches the dumps.
+          echo "/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_PATH"
 
       - name: Prepare container directories and copy fixtures
         run: |
