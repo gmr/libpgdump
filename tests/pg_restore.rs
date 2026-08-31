@@ -154,3 +154,25 @@ fn test_pg_restore_reads_legacy_archives() {
         }
     }
 }
+
+/// Regression test: compressing an archive older than 1.15 used to fail,
+/// because those versions have no compression-algorithm byte. Unlike the
+/// `bootstrap_fixture` cases, this runs on every matrix version, since the
+/// source archive is checked in rather than written by the local pg_dump.
+#[test]
+fn test_pg_restore_reads_compressed_legacy_archive() {
+    for compression in [
+        CompressionAlgorithm::Gzip,
+        CompressionAlgorithm::Lz4,
+        CompressionAlgorithm::Zstd,
+    ] {
+        for (format, out_name) in [(Format::Custom, "out.dump"), (Format::Directory, "out.dir")] {
+            round_trip_through_pg_restore(
+                &data_path("pg13-archive-1.14.dump"),
+                format,
+                compression,
+                out_name,
+            );
+        }
+    }
+}

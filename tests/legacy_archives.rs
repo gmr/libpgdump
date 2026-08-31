@@ -6,7 +6,7 @@
 mod common;
 use common::data_path;
 
-use libpgdump::Format;
+use libpgdump::{CompressionAlgorithm, Format};
 
 const ARCHIVE_1_13: &str = "pg11-archive-1.13.dump";
 const ARCHIVE_1_14: &str = "pg13-archive-1.14.dump";
@@ -84,5 +84,45 @@ fn test_empty_strings_survive_round_trip() {
             Some(""),
             "drop_stmt lost its empty string in {format:?} format"
         );
+    }
+}
+
+/// Regression test: archive versions before 1.15 have no compression-algorithm
+/// byte, so writing lz4 or zstd used to fail with `UnsupportedCompression`.
+/// Selecting one now raises the version to 1.15, which carries no other change.
+#[test]
+fn test_modern_compression_raises_archive_version() {
+    for (algorithm, expected) in [
+        (CompressionAlgorithm::None, "1.14.0"),
+        (CompressionAlgorithm::Gzip, "1.14.0"),
+        (CompressionAlgorithm::Lz4, "1.15.0"),
+        (CompressionAlgorithm::Zstd, "1.15.0"),
+    ] {
+        for format in [Format::Custom, Format::Directory] {
+            let mut dump =
+                libpgdump::load(data_path(ARCHIVE_1_14)).expect("failed to load 1.14 archive");
+            dump.set_format(format);
+            dump.set_compression(algorithm);
+            assert_eq!(
+                dump.version().to_string(),
+                expected,
+                "wrong archive version for {algorithm:?}"
+            );
+
+            let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+            let out_path = tmp.path().join("out");
+            dump.save(&out_path)
+                .unwrap_or_else(|e| panic!("failed to save {algorithm:?} {format:?}: {e}"));
+
+            let reloaded = libpgdump::load(&out_path).expect("failed to reload dump");
+            assert_eq!(reloaded.compression(), algorithm);
+            assert_eq!(reloaded.version().to_string(), expected);
+
+            let rows: Vec<&str> = reloaded
+                .table_data("public", "t")
+                .expect("failed to read table data")
+                .collect();
+            assert_eq!(rows.len(), 100, "data lost for {algorithm:?} {format:?}");
+        }
     }
 }
