@@ -92,7 +92,7 @@ pub fn write_archive(path: &Path, archive: &ArchiveData) -> Result<()> {
         }
 
         if let Some(blobs) = archive.blobs.get(&entry.dump_id) {
-            let toc_name = directory::blob_toc_filename(entry);
+            let toc_name = directory::blob_toc_filename(entry)?;
             let toc_data = std::fs::read(tmp.path().join(&toc_name))?;
             write_tar_member(&mut writer, &toc_name, &toc_data)?;
 

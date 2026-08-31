@@ -613,16 +613,27 @@ fn write_data_file(path: &Path, header: &Header, data: &[u8]) -> Result<()> {
 /// pg_restore opens the name stored in the TOC entry, so keep it: PostgreSQL 16
 /// and earlier write `blobs.toc`, 17 and later `blobs_<dumpid>.toc`. Entries
 /// with no stored name get the modern form.
-pub(crate) fn blob_toc_filename(entry: &Entry) -> String {
-    match entry.filename.as_deref() {
-        Some(name) if !name.is_empty() => name.to_string(),
-        _ => format!("blobs_{}.toc", entry.dump_id),
+///
+/// The name comes from the archive being read, so it is rejected unless it is a
+/// single plain filename; otherwise it could write outside the output directory.
+pub(crate) fn blob_toc_filename(entry: &Entry) -> Result<String> {
+    let name = match entry.filename.as_deref() {
+        Some(name) if !name.is_empty() => name,
+        _ => return Ok(format!("blobs_{}.toc", entry.dump_id)),
+    };
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(name.to_string()),
+        _ => Err(Error::DataIntegrity(format!(
+            "unsafe blob TOC filename: {name}"
+        ))),
     }
 }
 
 /// Write blob files and the blobs TOC file for a BLOBS entry.
 fn write_blob_files(dir: &Path, header: &Header, entry: &Entry, blobs: &[Blob]) -> Result<()> {
-    let toc_path = dir.join(blob_toc_filename(entry));
+    let toc_path = dir.join(blob_toc_filename(entry)?);
     let mut toc_file = BufWriter::new(fs::File::create(&toc_path)?);
 
     for blob in blobs {
@@ -955,5 +966,45 @@ mod tests {
         let blobs = parsed.blobs.get(&3413).unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0].data, b"blob content");
+    }
+
+    /// A blob TOC filename from the archive must not escape the output
+    /// directory.
+    #[test]
+    fn test_blob_toc_filename_rejects_path_traversal() {
+        let mut entry = Entry {
+            dump_id: 1,
+            had_dumper: true,
+            table_oid: "0".to_string(),
+            oid: "0".to_string(),
+            tag: None,
+            desc: ObjectType::Blobs,
+            section: Section::Data,
+            defn: None,
+            drop_stmt: None,
+            copy_stmt: None,
+            namespace: None,
+            tablespace: None,
+            tableam: None,
+            relkind: None,
+            owner: None,
+            with_oids: false,
+            dependencies: vec![],
+            data_state: OffsetState::NotSet,
+            offset: 0,
+            filename: Some("blobs.toc".to_string()),
+        };
+        assert_eq!(blob_toc_filename(&entry).unwrap(), "blobs.toc");
+
+        entry.filename = None;
+        assert_eq!(blob_toc_filename(&entry).unwrap(), "blobs_1.toc");
+
+        for name in ["../escape.toc", "/etc/passwd", "sub/blobs.toc"] {
+            entry.filename = Some(name.to_string());
+            assert!(
+                blob_toc_filename(&entry).is_err(),
+                "expected {name} to be rejected"
+            );
+        }
     }
 }
