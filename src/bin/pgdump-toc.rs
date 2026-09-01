@@ -4,7 +4,7 @@ use std::path::Path;
 
 use libpgdump::dump::detect_file_format;
 use libpgdump::error::Result;
-use libpgdump::format::{ArchiveMetadata, custom, directory};
+use libpgdump::format::{ArchiveMetadata, custom, directory, tar};
 use libpgdump::{Format, OffsetState};
 
 /// A simple utility to print archive header and TOC entries without loading data blocks.
@@ -41,7 +41,7 @@ fn run() -> Result<()> {
 
 fn load_metadata(path: &Path) -> Result<ArchiveMetadata> {
     match detect_file_format(path)? {
-        Format::Tar => Err(libpgdump::Error::UnsupportedFormat(Format::Tar as u8)),
+        Format::Tar => tar::read_metadata(path),
         Format::Directory => directory::read_metadata(path),
         Format::Custom => {
             let file = File::open(path)?;

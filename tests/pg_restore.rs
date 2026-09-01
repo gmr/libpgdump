@@ -1,15 +1,16 @@
 //! Tests that archives written by libpgdump are readable by pg_restore.
 //!
-//! These tests need the `pg_restore` binary on PATH and the fixtures created by
-//! `just bootstrap`; they skip when either is missing.
+//! These tests need the `pg_restore` binary on PATH. The ones driven by
+//! `build/data` also need the fixtures created by `just bootstrap`; they skip
+//! when either is missing.
 
 mod common;
-use common::fixture_path;
+use common::{data_path, fixture_path};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use libpgdump::Format;
+use libpgdump::{CompressionAlgorithm, Format};
 
 /// Run pg_restore with the given arguments, or `None` if pg_restore is missing.
 fn pg_restore(args: &[&str]) -> Option<std::process::Output> {
@@ -18,6 +19,34 @@ fn pg_restore(args: &[&str]) -> Option<std::process::Output> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => panic!("failed to run pg_restore: {err}"),
     }
+}
+
+/// The major version of the pg_restore on PATH, or `None` if it is missing.
+fn pg_restore_major_version() -> Option<u32> {
+    let output = pg_restore(&["--version"])?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // "pg_restore (PostgreSQL) 16.4 (Debian 16.4-1.pgdg120+1)"
+    let version = text.split_whitespace().nth(2)?;
+    version.split(['.', 'a', 'b', 'r']).next()?.parse().ok()
+}
+
+/// The compression algorithms the pg_restore on PATH can actually read.
+///
+/// lz4 and zstd arrived in PostgreSQL 16, together with archive version 1.15,
+/// which carries the compression-algorithm byte they need. Older pg_restore
+/// rejects such an archive outright with "unsupported version (1.15)", so
+/// there is nothing to assert for them before 16.
+fn restorable_compression() -> Vec<CompressionAlgorithm> {
+    let mut algorithms = vec![CompressionAlgorithm::Gzip];
+    match pg_restore_major_version() {
+        Some(major) if major >= 16 => {
+            algorithms.push(CompressionAlgorithm::Lz4);
+            algorithms.push(CompressionAlgorithm::Zstd);
+        }
+        Some(major) => eprintln!("skipping lz4 and zstd: pg_restore {major} cannot read them"),
+        None => eprintln!("skipping: pg_restore not found"),
+    }
+    algorithms
 }
 
 /// Assert that pg_restore can read the whole archive, TOC and data alike.
@@ -38,15 +67,17 @@ fn assert_readable(path: &Path) {
     );
 }
 
-/// Load a fixture, save it in `format`, and check pg_restore can read it back.
-fn round_trip_through_pg_restore(fixture: &str, format: Format, out_name: &str) {
-    let Some(path) = fixture_path(fixture) else {
-        eprintln!("skipping: fixture {fixture} not found, run `just bootstrap`");
-        return;
-    };
-
-    let mut dump = libpgdump::load(&path).expect("failed to load dump");
+/// Load `source`, save it in `format` and `compression`, and check pg_restore
+/// can read the result.
+fn round_trip_through_pg_restore(
+    source: &Path,
+    format: Format,
+    compression: CompressionAlgorithm,
+    out_name: &str,
+) {
+    let mut dump = libpgdump::load(source).expect("failed to load dump");
     dump.set_format(format);
+    dump.set_compression(compression);
 
     let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
     let out_path = tmp.path().join(out_name);
@@ -55,21 +86,110 @@ fn round_trip_through_pg_restore(fixture: &str, format: Format, out_name: &str) 
     assert_readable(&out_path);
 }
 
+/// Resolve a generated fixture, or `None` when `just bootstrap` has not run.
+fn bootstrap_fixture(name: &str) -> Option<PathBuf> {
+    let path = fixture_path(name);
+    if path.is_none() {
+        eprintln!("skipping: fixture {name} not found, run `just bootstrap`");
+    }
+    path
+}
+
 #[test]
 fn test_pg_restore_reads_custom() {
-    round_trip_through_pg_restore("dump.not-compressed", Format::Custom, "out.dump");
+    let Some(path) = bootstrap_fixture("dump.not-compressed") else {
+        return;
+    };
+    round_trip_through_pg_restore(
+        &path,
+        Format::Custom,
+        CompressionAlgorithm::None,
+        "out.dump",
+    );
 }
 
 /// Regression test: the directory writer used to store a NULL filename for
 /// entries without a data file, which crashes pg_restore's `_ReadExtraToc`.
 #[test]
 fn test_pg_restore_reads_directory() {
-    round_trip_through_pg_restore("dump.directory", Format::Directory, "out.dir");
+    let Some(path) = bootstrap_fixture("dump.directory") else {
+        return;
+    };
+    round_trip_through_pg_restore(
+        &path,
+        Format::Directory,
+        CompressionAlgorithm::None,
+        "out.dir",
+    );
 }
 
 /// Regression test: tar members used to be written in filename order, which
 /// pg_restore rejects when it does not match the TOC order.
 #[test]
 fn test_pg_restore_reads_tar() {
-    round_trip_through_pg_restore("dump.directory", Format::Tar, "out.tar");
+    let Some(path) = bootstrap_fixture("dump.directory") else {
+        return;
+    };
+    round_trip_through_pg_restore(&path, Format::Tar, CompressionAlgorithm::None, "out.tar");
+}
+
+#[test]
+fn test_pg_restore_reads_compressed_custom() {
+    let Some(path) = bootstrap_fixture("dump.not-compressed") else {
+        return;
+    };
+    for compression in restorable_compression() {
+        round_trip_through_pg_restore(&path, Format::Custom, compression, "out.dump");
+    }
+}
+
+#[test]
+fn test_pg_restore_reads_compressed_directory() {
+    let Some(path) = bootstrap_fixture("dump.directory") else {
+        return;
+    };
+    for compression in restorable_compression() {
+        round_trip_through_pg_restore(&path, Format::Directory, compression, "out.dir");
+    }
+}
+
+/// Regression test: reading an empty string as NULL produced archives that
+/// crash pg_restore before PostgreSQL 12. Modern pg_restore tolerates it, so
+/// this only proves the rewritten archives stay readable; the fidelity itself
+/// is checked in `legacy_archives.rs`.
+#[test]
+fn test_pg_restore_reads_legacy_archives() {
+    for name in ["pg11-archive-1.13.dump", "pg13-archive-1.14.dump"] {
+        for (format, out_name) in [
+            (Format::Custom, "out.dump"),
+            (Format::Directory, "out.dir"),
+            (Format::Tar, "out.tar"),
+        ] {
+            round_trip_through_pg_restore(
+                &data_path(name),
+                format,
+                CompressionAlgorithm::None,
+                out_name,
+            );
+        }
+    }
+}
+
+/// Regression test: compressing an archive older than 1.15 used to fail,
+/// because those versions have no compression-algorithm byte. Unlike the
+/// `bootstrap_fixture` cases, the source archive is checked in rather than
+/// written by the local pg_dump, so the pre-1.15 path is exercised on every
+/// matrix version instead of only where pg_dump happens to write 1.14.
+#[test]
+fn test_pg_restore_reads_compressed_legacy_archive() {
+    for compression in restorable_compression() {
+        for (format, out_name) in [(Format::Custom, "out.dump"), (Format::Directory, "out.dir")] {
+            round_trip_through_pg_restore(
+                &data_path("pg13-archive-1.14.dump"),
+                format,
+                compression,
+                out_name,
+            );
+        }
+    }
 }

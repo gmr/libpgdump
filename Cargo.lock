@@ -191,7 +191,7 @@ checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
 name = "libpgdump"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "flate2",
  "lz4_flex",

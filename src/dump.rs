@@ -412,7 +412,19 @@ impl Dump {
     }
 
     /// Set compression algorithm for writing.
+    ///
+    /// Archive versions before 1.15 have no compression-algorithm byte in the
+    /// header; they can only express none and gzip. Selecting lz4 or zstd on
+    /// an older archive raises the version to 1.15, which is lossless here
+    /// because 1.15 added nothing but that byte.
     pub fn set_compression(&mut self, alg: CompressionAlgorithm) {
+        const COMPRESSION_ALGORITHM_VERSION: ArchiveVersion = ArchiveVersion::new(1, 15, 0);
+
+        let needs_algorithm_byte =
+            !matches!(alg, CompressionAlgorithm::None | CompressionAlgorithm::Gzip);
+        if needs_algorithm_byte && self.header.version < COMPRESSION_ALGORITHM_VERSION {
+            self.header.version = COMPRESSION_ALGORITHM_VERSION;
+        }
         self.header.compression = alg;
     }
 
