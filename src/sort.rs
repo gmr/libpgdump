@@ -42,6 +42,10 @@ fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
 #[derive(Clone)]
 struct SortKey {
     priority: i32,
+    /// The priority of the object this entry describes, which orders the
+    /// entries that share a priority of their own.  Equal to `priority`
+    /// unless the entry is statistics data.
+    target_priority: i32,
     namespace: Option<String>,
     /// The name pg_dump sorts on, which is not always the whole tag.
     tag: Option<String>,
@@ -69,6 +73,36 @@ fn trailing_rank(desc: &ObjectType) -> Option<u8> {
         ObjectType::Acl => Some(3),
         _ => None,
     }
+}
+
+/// The key for a `STATISTICS DATA` entry.
+///
+/// pg_dump keeps these in one block at their own priority, but orders the
+/// block by the kind of object each entry describes: a relation's statistics
+/// before an index's.  The topological pass then pulls each index's
+/// statistics down against the entry that creates the index, while the
+/// relation statistics stay with the table data.  Sorting the block by name
+/// alone interleaves the two kinds, and the topological pass then drags the
+/// relation statistics along with the index ones.
+///
+/// The dependencies name the object described along with ids the archive
+/// does not contain: pg_dump records the underlying index of a constraint,
+/// and a section boundary that is never written as a TOC entry.  Those are
+/// ignored here, unlike in the stricter rule for the other attachments,
+/// which would reject the entry outright.
+fn statistics_key(entries: &[Entry], id_to_idx: &HashMap<i32, usize>, idx: usize) -> SortKey {
+    let entry = &entries[idx];
+    let mut key = SortKey::own(entry, owner_tag(entry, entries, id_to_idx));
+
+    let mut targets = entry
+        .dependencies
+        .iter()
+        .filter_map(|id| id_to_idx.get(id).copied())
+        .filter(|&dep| dep != idx);
+    if let (Some(target), None) = (targets.next(), targets.next()) {
+        key.target_priority = entries[target].desc.priority();
+    }
+    key
 }
 
 /// Object types whose TOC tag is `"<table> <name>"`.
@@ -144,6 +178,7 @@ impl SortKey {
     fn own(entry: &Entry, owner: Option<&str>) -> Self {
         SortKey {
             priority: entry.desc.priority(),
+            target_priority: entry.desc.priority(),
             namespace: entry.namespace.clone(),
             tag: sort_name(entry, owner),
             desc: entry.desc.clone(),
@@ -166,6 +201,7 @@ impl SortKey {
     /// Whether both keys borrow from, or belong to, the same target entry.
     fn same_target(&self, other: &Self) -> bool {
         self.priority == other.priority
+            && self.target_priority == other.target_priority
             && self.namespace == other.namespace
             && self.tag == other.tag
             && self.desc == other.desc
@@ -174,6 +210,7 @@ impl SortKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.priority
             .cmp(&other.priority)
+            .then_with(|| self.target_priority.cmp(&other.target_priority))
             .then_with(|| cmp_opt_str(&self.namespace, &other.namespace))
             .then_with(|| cmp_opt_str(&self.tag, &other.tag))
             .then_with(|| self.desc.cmp(&other.desc))
@@ -198,6 +235,9 @@ fn sort_key(entries: &[Entry], id_to_idx: &HashMap<i32, usize>, idx: usize, budg
     let entry = &entries[idx];
     let own = || SortKey::own(entry, owner_tag(entry, entries, id_to_idx));
 
+    if entry.desc == ObjectType::StatisticsData {
+        return statistics_key(entries, id_to_idx, idx);
+    }
     let Some(rank) = trailing_rank(&entry.desc) else {
         return own();
     };
@@ -719,6 +759,98 @@ mod tests {
         sort_entries(&mut entries);
         let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
         assert_eq!(ids, vec![2, 1]);
+    }
+
+    #[test]
+    fn test_statistics_sort_by_the_object_they_describe() {
+        // pg_dump keeps statistics in one block ordered by the kind of
+        // object each describes: every relation's statistics, then every
+        // index's.  The topological pass then pulls the index statistics
+        // down against the constraints while the relation statistics stay
+        // with the table data.
+        //
+        // Two tables are needed to tell the rule apart from a plain sort by
+        // name, which would interleave the block as a, a_pkey, b, b_pkey and
+        // drag the statistics for `b` down with those for `a_pkey`.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Table, Some("app"), Some("a"), vec![]),
+            make_entry(2, ObjectType::Table, Some("app"), Some("b"), vec![]),
+            make_entry(3, ObjectType::TableData, Some("app"), Some("a"), vec![1]),
+            make_entry(4, ObjectType::TableData, Some("app"), Some("b"), vec![2]),
+            make_entry(
+                5,
+                ObjectType::Constraint,
+                Some("app"),
+                Some("a a_pkey"),
+                vec![1],
+            ),
+            make_entry(
+                6,
+                ObjectType::Constraint,
+                Some("app"),
+                Some("b b_pkey"),
+                vec![2],
+            ),
+            make_entry(
+                7,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("a"),
+                vec![1],
+            ),
+            make_entry(
+                8,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("a_pkey"),
+                vec![5],
+            ),
+            make_entry(
+                9,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("b"),
+                vec![2],
+            ),
+            make_entry(
+                10,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("b_pkey"),
+                vec![6],
+            ),
+        ];
+        sort_entries(&mut entries);
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 7, 9, 5, 8, 6, 10]);
+    }
+
+    #[test]
+    fn test_statistics_without_a_target_keep_their_own_priority() {
+        // The object described by entry 1 is not in this archive, so those
+        // statistics sort on their own type (31) and land behind the
+        // statistics for table `z`, which take the table's priority (24)
+        // even though "z" follows "a" by name.
+        let mut entries = vec![
+            make_entry(
+                1,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("a"),
+                vec![99],
+            ),
+            make_entry(2, ObjectType::Table, Some("app"), Some("z"), vec![]),
+            make_entry(
+                3,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("z"),
+                vec![2],
+            ),
+        ];
+        sort_entries(&mut entries);
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        assert_eq!(ids, vec![2, 3, 1]);
     }
 
     #[test]
