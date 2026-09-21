@@ -518,3 +518,95 @@ fn test_cycle_members_sort_after_their_schema() {
     assert!(pos("SCHEMA app") < pos("TABLE b"), "got {order:?}");
     assert!(pos("ENCODING ") < pos("SCHEMA app"), "got {order:?}");
 }
+
+/// The TOC entries of `dump`, as `"DESC tag"` strings.
+fn toc_order(dump: &libpgdump::Dump) -> Vec<String> {
+    dump.entries()
+        .iter()
+        .map(|e| format!("{} {}", e.desc.as_str(), e.tag.clone().unwrap_or_default()))
+        .collect()
+}
+
+#[test]
+fn test_load_save_preserves_toc_order() {
+    let Some(path) = fixture_path("pg18.custom") else {
+        return;
+    };
+    let dump = libpgdump::load(&path).expect("failed to load fixture");
+    assert!(
+        !dump.sorts_on_save(),
+        "a freshly loaded archive should keep its TOC order"
+    );
+    let before = toc_order(&dump);
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+
+    assert_eq!(before, toc_order(&reloaded));
+}
+
+#[test]
+fn test_adding_an_entry_restores_sort_on_save() {
+    let Some(path) = fixture_path("pg18.custom") else {
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    assert!(!dump.sorts_on_save());
+
+    dump.add_entry(
+        ObjectType::Schema,
+        Some(""),
+        Some("zzz"),
+        Some("postgres"),
+        Some("CREATE SCHEMA zzz;\n"),
+        None,
+        None,
+        &[],
+    )
+    .expect("failed to add schema");
+    assert!(
+        dump.sorts_on_save(),
+        "adding an entry must re-enable sorting"
+    );
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+
+    // The appended schema sorts up into the schema section, not last.
+    let order = toc_order(&reloaded);
+    let schema_pos = order
+        .iter()
+        .position(|s| s == "SCHEMA zzz")
+        .expect("missing");
+    assert!(schema_pos < order.len() - 1, "got {order:?}");
+}
+
+#[test]
+fn test_sort_matches_pg_dump_prelude_and_comment_placement() {
+    let Some(path) = fixture_path("pg18.custom") else {
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    let pg_dump_order = toc_order(&dump);
+    dump.sort_entries();
+    let order = toc_order(&dump);
+
+    // pg_dump writes ENCODING, STDSTRINGS, SEARCHPATH in that order.
+    assert_eq!(&order[..3], &pg_dump_order[..3]);
+    assert_eq!(order[0], "ENCODING ENCODING");
+    assert_eq!(order[1], "STDSTRINGS STDSTRINGS");
+    assert_eq!(order[2], "SEARCHPATH SEARCHPATH");
+
+    // A COMMENT sorts directly after the object it describes.
+    let ext = order
+        .iter()
+        .position(|s| s == "EXTENSION btree_gist")
+        .expect("missing extension");
+    assert_eq!(
+        order[ext + 1],
+        "COMMENT EXTENSION btree_gist",
+        "got {order:?}"
+    );
+}

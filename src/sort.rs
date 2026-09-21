@@ -14,6 +14,7 @@
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::entry::Entry;
+use crate::types::ObjectType;
 
 /// Compare `Option<String>` with `Some` sorting before `None`.
 ///
@@ -29,16 +30,77 @@ fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
     }
 }
 
-/// Compare two entries by type priority, then namespace, then tag.
+/// The phase-1 sort key for one entry, mirroring `DOTypeNameCompare` in
+/// pg_dump_sort.c.
 ///
-/// This mirrors `DOTypeNameCompare` in pg_dump_sort.c.
-fn entry_cmp(a: &Entry, b: &Entry) -> std::cmp::Ordering {
-    a.desc
-        .priority()
-        .cmp(&b.desc.priority())
-        .then_with(|| cmp_opt_str(&a.namespace, &b.namespace))
-        .then_with(|| cmp_opt_str(&a.tag, &b.tag))
-        .then_with(|| a.desc.cmp(&b.desc))
+/// A COMMENT does not carry a key of its own: pg_dump writes a comment while
+/// it writes the object being commented on, so the comment lands directly
+/// after that object rather than at the priority COMMENT would otherwise
+/// give it.  Such an entry borrows the key of the entry it depends on and
+/// sorts just behind it, which no fixed value in `ObjectType::priority()`
+/// could express.
+struct SortKey {
+    priority: i32,
+    namespace: Option<String>,
+    tag: Option<String>,
+    desc: ObjectType,
+    /// 0 for an entry sorting on its own key, 1 for one trailing its target.
+    trailing: u8,
+    /// Own tag, to keep several comments on one object in a stable order.
+    own_tag: Option<String>,
+}
+
+impl SortKey {
+    fn own(entry: &Entry) -> Self {
+        SortKey {
+            priority: entry.desc.priority(),
+            namespace: entry.namespace.clone(),
+            tag: entry.tag.clone(),
+            desc: entry.desc.clone(),
+            trailing: 0,
+            own_tag: entry.tag.clone(),
+        }
+    }
+
+    /// The key that sorts `entry` directly after `target`.
+    fn trailing(entry: &Entry, target: &Entry) -> Self {
+        SortKey {
+            trailing: 1,
+            own_tag: entry.tag.clone(),
+            ..SortKey::own(target)
+        }
+    }
+
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| cmp_opt_str(&self.namespace, &other.namespace))
+            .then_with(|| cmp_opt_str(&self.tag, &other.tag))
+            .then_with(|| self.desc.cmp(&other.desc))
+            .then_with(|| self.trailing.cmp(&other.trailing))
+            .then_with(|| cmp_opt_str(&self.own_tag, &other.own_tag))
+    }
+}
+
+/// Build the phase-1 sort key for every entry.
+fn sort_keys(entries: &[Entry]) -> Vec<SortKey> {
+    let id_to_idx = build_id_to_idx(entries);
+    entries
+        .iter()
+        .map(|entry| {
+            // Only a COMMENT trails its target, and only when that target is
+            // a single entry present in this archive.
+            if entry.desc == ObjectType::Comment
+                && let [dep_id] = entry.dependencies[..]
+                && let Some(&target) = id_to_idx.get(&dep_id)
+                && entries[target].desc != ObjectType::Comment
+            {
+                SortKey::trailing(entry, &entries[target])
+            } else {
+                SortKey::own(entry)
+            }
+        })
+        .collect()
 }
 
 /// Sort entries using the same two-phase strategy as pg_dump:
@@ -58,7 +120,10 @@ pub(crate) fn sort_entries(entries: &mut Vec<Entry>) {
     }
 
     // Phase 1: cosmetic type/name sort
-    entries.sort_by(entry_cmp);
+    let keys = sort_keys(entries);
+    let mut ordering: Vec<usize> = (0..entries.len()).collect();
+    ordering.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+    apply_ordering(entries, ordering);
 
     // Phase 2: topological sort with heap-based tie-breaking
     topo_sort(entries);
@@ -111,7 +176,11 @@ fn topo_sort(entries: &mut Vec<Entry>) {
         }
     };
 
-    // Reorder entries according to `ordering` using moves (no cloning)
+    apply_ordering(entries, ordering);
+}
+
+/// Permute `entries` into `ordering`, moving rather than cloning.
+fn apply_ordering(entries: &mut Vec<Entry>, ordering: Vec<usize>) {
     let mut old_entries: Vec<Option<Entry>> =
         std::mem::take(entries).into_iter().map(Some).collect();
     entries.extend(ordering.into_iter().map(|i| old_entries[i].take().unwrap()));
