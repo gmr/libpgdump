@@ -277,8 +277,11 @@ impl Dump {
     /// order as no longer authoritative and [`Dump::save`] will sort.  Use
     /// [`Dump::set_sort_on_save`] to override that.
     pub fn get_entry_mut(&mut self, dump_id: i32) -> Option<&mut Entry> {
-        self.sort_on_save = true;
-        self.entries.iter_mut().find(|e| e.dump_id == dump_id)
+        let entry = self.entries.iter_mut().find(|e| e.dump_id == dump_id);
+        if entry.is_some() {
+            self.sort_on_save = true;
+        }
+        entry
     }
 
     /// Iterate over table data rows for the given namespace and table.

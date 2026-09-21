@@ -1,4 +1,6 @@
 mod common;
+use std::collections::BTreeMap;
+
 use common::fixture_path;
 use libpgdump::ObjectType;
 
@@ -621,7 +623,8 @@ fn test_sort_places_attachments_after_their_target() {
         .enumerate()
         .map(|(i, e)| (e.dump_id, i))
         .collect();
-    let mut checked = 0;
+    // Attachments of one target form an unbroken block directly behind it.
+    let mut blocks: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, entry) in dump.entries().iter().enumerate() {
         let attaches = matches!(
             entry.desc,
@@ -636,15 +639,21 @@ fn test_sort_places_attachments_after_their_target() {
         else {
             continue;
         };
-        assert!(
-            i > target && i - target <= 3,
-            "{} should follow its target {}, got {order:?}",
-            order[i],
+        blocks.entry(target).or_default().push(i);
+    }
+    assert!(
+        !blocks.is_empty(),
+        "fixture exercised no attachment entries"
+    );
+    for (target, mut attachments) in blocks {
+        attachments.sort_unstable();
+        let expected: Vec<usize> = (target + 1..=target + attachments.len()).collect();
+        assert_eq!(
+            attachments, expected,
+            "attachments of {} should occupy {expected:?}, got {order:?}",
             order[target]
         );
-        checked += 1;
     }
-    assert!(checked > 0, "fixture exercised no attachment entries");
 }
 
 #[test]

@@ -39,6 +39,7 @@ fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
 /// type would give them.  Such an entry borrows the key of the entry it
 /// depends on and sorts just behind it, which no fixed value in
 /// `ObjectType::priority()` could express.
+#[derive(Clone)]
 struct SortKey {
     priority: i32,
     namespace: Option<String>,
@@ -48,6 +49,10 @@ struct SortKey {
     /// 0 for an entry sorting on its own key, otherwise its rank behind the
     /// target it attaches to.
     trailing: u8,
+    /// How many attachment steps separate this entry from the target whose
+    /// key it borrows.  A column ACL trails its table-level ACL, so it is
+    /// two steps behind the table and sorts after the one-step ACL.
+    depth: u8,
     /// Full tag, to keep entries that share a sort name in a stable order.
     own_tag: Option<String>,
 }
@@ -84,63 +89,86 @@ fn tag_is_table_qualified(desc: &ObjectType) -> bool {
     )
 }
 
-/// The part of a table-qualified tag that pg_dump sorts on.
+/// The tag of the table that qualifies `entry`, taken from its dependencies.
 ///
-/// The leading table name is written by `fmtId`, so it is double-quoted when
-/// it needs to be, with embedded quotes doubled.  A tag that does not have
-/// the expected shape is used whole.
+/// pg_dump writes a table-qualified tag as `"<table> <name>"` without quoting
+/// the table name, so a table called `order items` gives `order items a_pk`
+/// and the tag alone cannot say where the table name ends.  The owning table
+/// is a dependency of the entry, so its tag supplies the prefix.  An FK
+/// constraint depends on two tables, and the longest matching prefix is the
+/// one that qualifies the tag.
+fn owner_tag<'a>(
+    entry: &Entry,
+    entries: &'a [Entry],
+    id_to_idx: &HashMap<i32, usize>,
+) -> Option<&'a str> {
+    let tag = entry.tag.as_deref()?;
+    entry
+        .dependencies
+        .iter()
+        .filter_map(|id| id_to_idx.get(id))
+        .filter_map(|&idx| entries[idx].tag.as_deref())
+        .filter(|owner| {
+            tag.len() > owner.len()
+                && tag.as_bytes()[owner.len()] == b' '
+                && tag.starts_with(*owner)
+        })
+        .max_by_key(|owner| owner.len())
+}
+
+/// The part of a table-qualified tag that pg_dump sorts on, for an entry
+/// whose owning table is not in the archive.
+///
+/// This splits at the first space, which is correct unless the table name
+/// itself contains one.  A tag that does not have the expected shape is used
+/// whole.
 fn strip_table_qualifier(tag: &str) -> &str {
-    let rest = if let Some(quoted) = tag.strip_prefix('"') {
-        let mut chars = quoted.char_indices();
-        loop {
-            match chars.next() {
-                // A doubled quote is an escape, not the end of the name.
-                Some((_, '"')) if matches!(chars.clone().next(), Some((_, '"'))) => {
-                    chars.next();
-                }
-                Some((i, '"')) => break &quoted[i + 1..],
-                Some(_) => {}
-                None => return tag,
-            }
-        }
-    } else {
-        tag
-    };
-    match rest.split_once(' ') {
+    match tag.split_once(' ') {
         Some((_, name)) => name,
         None => tag,
     }
 }
 
 /// The name pg_dump sorts `entry` by.
-fn sort_name(entry: &Entry) -> Option<String> {
+fn sort_name(entry: &Entry, owner: Option<&str>) -> Option<String> {
     match &entry.tag {
-        Some(tag) if tag_is_table_qualified(&entry.desc) => {
-            Some(strip_table_qualifier(tag).to_string())
-        }
+        Some(tag) if tag_is_table_qualified(&entry.desc) => Some(match owner {
+            Some(owner) => tag[owner.len() + 1..].to_string(),
+            None => strip_table_qualifier(tag).to_string(),
+        }),
         other => other.clone(),
     }
 }
 
 impl SortKey {
-    fn own(entry: &Entry) -> Self {
+    fn own(entry: &Entry, owner: Option<&str>) -> Self {
         SortKey {
             priority: entry.desc.priority(),
             namespace: entry.namespace.clone(),
-            tag: sort_name(entry),
+            tag: sort_name(entry, owner),
             desc: entry.desc.clone(),
             trailing: 0,
+            depth: 0,
             own_tag: entry.tag.clone(),
         }
     }
 
-    /// The key that sorts `entry` directly after `target`.
-    fn trailing(entry: &Entry, target: &Entry, rank: u8) -> Self {
+    /// The key that sorts `entry` directly after the entry keyed by `target`.
+    fn trailing(entry: &Entry, target: &SortKey, rank: u8) -> Self {
         SortKey {
             trailing: rank,
+            depth: target.depth + 1,
             own_tag: entry.tag.clone(),
-            ..SortKey::own(target)
+            ..target.clone()
         }
+    }
+
+    /// Whether both keys borrow from, or belong to, the same target entry.
+    fn same_target(&self, other: &Self) -> bool {
+        self.priority == other.priority
+            && self.namespace == other.namespace
+            && self.tag == other.tag
+            && self.desc == other.desc
     }
 
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -150,28 +178,62 @@ impl SortKey {
             .then_with(|| cmp_opt_str(&self.tag, &other.tag))
             .then_with(|| self.desc.cmp(&other.desc))
             .then_with(|| self.trailing.cmp(&other.trailing))
+            .then_with(|| self.depth.cmp(&other.depth))
             .then_with(|| cmp_opt_str(&self.own_tag, &other.own_tag))
+    }
+}
+
+/// How far an attachment chain is followed: an object, its ACL, and the
+/// column ACL that trails that ACL.
+const MAX_ATTACHMENT_DEPTH: u8 = 3;
+
+/// Build the phase-1 sort key for one entry.
+///
+/// An attachment trails the entry it depends on.  Every dependency it has
+/// must lead to the same target, so an attachment with unrelated
+/// dependencies keeps a key of its own.  A column ACL depends on both its
+/// table and the table-level ACL; both lead to the table, and the chain
+/// through the ACL is the longer one, so the column ACL sorts behind it.
+fn sort_key(entries: &[Entry], id_to_idx: &HashMap<i32, usize>, idx: usize, budget: u8) -> SortKey {
+    let entry = &entries[idx];
+    let own = || SortKey::own(entry, owner_tag(entry, entries, id_to_idx));
+
+    let Some(rank) = trailing_rank(&entry.desc) else {
+        return own();
+    };
+    if budget == 0 || entry.dependencies.is_empty() {
+        return own();
+    }
+
+    let mut target: Option<SortKey> = None;
+    for dep_id in &entry.dependencies {
+        let Some(&dep) = id_to_idx.get(dep_id) else {
+            return own();
+        };
+        if dep == idx {
+            return own();
+        }
+        let key = sort_key(entries, id_to_idx, dep, budget - 1);
+        target = match target {
+            None => Some(key),
+            Some(prev) if prev.same_target(&key) => {
+                Some(if key.depth > prev.depth { key } else { prev })
+            }
+            Some(_) => return own(),
+        };
+    }
+
+    match target {
+        Some(target) => SortKey::trailing(entry, &target, rank),
+        None => own(),
     }
 }
 
 /// Build the phase-1 sort key for every entry.
 fn sort_keys(entries: &[Entry]) -> Vec<SortKey> {
     let id_to_idx = build_id_to_idx(entries);
-    entries
-        .iter()
-        .map(|entry| {
-            // An entry only trails its target when that target is a single
-            // entry present in this archive, and is not itself an attachment.
-            if let Some(rank) = trailing_rank(&entry.desc)
-                && let [dep_id] = entry.dependencies[..]
-                && let Some(&target) = id_to_idx.get(&dep_id)
-                && trailing_rank(&entries[target].desc).is_none()
-            {
-                SortKey::trailing(entry, &entries[target], rank)
-            } else {
-                SortKey::own(entry)
-            }
-        })
+    (0..entries.len())
+        .map(|idx| sort_key(entries, &id_to_idx, idx, MAX_ATTACHMENT_DEPTH))
         .collect()
 }
 
@@ -533,11 +595,64 @@ mod tests {
     #[test]
     fn test_strip_table_qualifier() {
         assert_eq!(strip_table_qualifier("nn a_nn"), "a_nn");
-        assert_eq!(strip_table_qualifier("\"my table\" a_nn"), "a_nn");
-        assert_eq!(strip_table_qualifier("\"say \"\"hi\"\"\" ck_ok"), "ck_ok");
         // A tag that is not table-qualified is used whole.
         assert_eq!(strip_table_qualifier("a_nn"), "a_nn");
-        assert_eq!(strip_table_qualifier("\"unterminated"), "\"unterminated");
+    }
+
+    #[test]
+    fn test_constraint_on_table_whose_name_has_a_space() {
+        // pg_dump writes the table name into the tag unquoted, so only the
+        // owning table's own tag says where that name ends.  Sorted by
+        // constraint name, a_pk precedes bookings_pkey.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Table, Some("t"), Some("order items"), vec![]),
+            make_entry(2, ObjectType::Table, Some("t"), Some("bookings"), vec![]),
+            make_entry(
+                3,
+                ObjectType::Constraint,
+                Some("t"),
+                Some("bookings bookings_pkey"),
+                vec![2],
+            ),
+            make_entry(
+                4,
+                ObjectType::Constraint,
+                Some("t"),
+                Some("order items a_pk"),
+                vec![1],
+            ),
+        ];
+
+        sort_entries(&mut entries);
+
+        let constraints: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.desc == ObjectType::Constraint)
+            .filter_map(|e| e.tag.as_deref())
+            .collect();
+        assert_eq!(constraints, ["order items a_pk", "bookings bookings_pkey"]);
+    }
+
+    #[test]
+    fn test_column_acl_follows_the_table_acl() {
+        // A column ACL depends on both the table and the table-level ACL,
+        // and pg_dump writes it directly after that ACL.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Table, Some("t"), Some("acls"), vec![]),
+            make_entry(
+                3,
+                ObjectType::Acl,
+                Some("t"),
+                Some("COLUMN acls.open"),
+                vec![1, 2],
+            ),
+            make_entry(2, ObjectType::Acl, Some("t"), Some("TABLE acls"), vec![1]),
+        ];
+
+        sort_entries(&mut entries);
+
+        let order: Vec<&str> = entries.iter().filter_map(|e| e.tag.as_deref()).collect();
+        assert_eq!(order, ["acls", "TABLE acls", "COLUMN acls.open"]);
     }
 
     #[test]
