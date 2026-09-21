@@ -11,10 +11,10 @@ categories = ["database", "parser-implementations"]
 
 [dependencies]
 flate2 = "1"
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 tempfile = "3"
 thiserror = "2"
-zstd = "0.13"
+zstd = "0.14"
 
 [dev-dependencies]
 pretty_assertions = "1"
