@@ -1,4 +1,6 @@
 mod common;
+use std::collections::BTreeMap;
+
 use common::fixture_path;
 use libpgdump::ObjectType;
 
@@ -517,4 +519,165 @@ fn test_cycle_members_sort_after_their_schema() {
     assert!(pos("SCHEMA app") < pos("TABLE a"), "got {order:?}");
     assert!(pos("SCHEMA app") < pos("TABLE b"), "got {order:?}");
     assert!(pos("ENCODING ") < pos("SCHEMA app"), "got {order:?}");
+}
+
+/// The TOC entries of `dump`, as `"DESC tag"` strings.
+fn toc_order(dump: &libpgdump::Dump) -> Vec<String> {
+    dump.entries()
+        .iter()
+        .map(|e| format!("{} {}", e.desc.as_str(), e.tag.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// A fixture every CI job generates, via `just bootstrap`.
+const FIXTURE: &str = "dump.not-compressed";
+
+#[test]
+fn test_load_save_preserves_toc_order() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let dump = libpgdump::load(&path).expect("failed to load fixture");
+    assert!(
+        !dump.sorts_on_save(),
+        "a freshly loaded archive should keep its TOC order"
+    );
+    let before = toc_order(&dump);
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+
+    assert_eq!(before, toc_order(&reloaded));
+}
+
+#[test]
+fn test_adding_an_entry_restores_sort_on_save() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    assert!(!dump.sorts_on_save());
+
+    dump.add_entry(
+        ObjectType::Schema,
+        Some(""),
+        Some("zzz"),
+        Some("postgres"),
+        Some("CREATE SCHEMA zzz;\n"),
+        None,
+        None,
+        &[],
+    )
+    .expect("failed to add schema");
+    assert!(
+        dump.sorts_on_save(),
+        "adding an entry must re-enable sorting"
+    );
+
+    let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    dump.save(tmp.path()).expect("failed to save dump");
+    let reloaded = libpgdump::load(tmp.path()).expect("failed to reload dump");
+
+    // The appended schema sorts up into the schema section, not last.
+    let order = toc_order(&reloaded);
+    let schema_pos = order
+        .iter()
+        .position(|s| s == "SCHEMA zzz")
+        .expect("missing schema");
+    assert!(schema_pos < order.len() - 1, "got {order:?}");
+}
+
+#[test]
+fn test_sort_reproduces_pg_dump_prelude() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    dump.sort_entries();
+    let order = toc_order(&dump);
+
+    assert_eq!(order[0], "ENCODING ENCODING");
+    assert_eq!(order[1], "STDSTRINGS STDSTRINGS");
+    assert_eq!(order[2], "SEARCHPATH SEARCHPATH");
+}
+
+#[test]
+fn test_sort_places_attachments_after_their_target() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    dump.sort_entries();
+    let order = toc_order(&dump);
+
+    // Every comment, security label and ACL whose target is a single entry
+    // in this archive follows that entry immediately, as pg_dump writes it.
+    let positions: Vec<(i32, usize)> = dump
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.dump_id, i))
+        .collect();
+    // Attachments of one target form an unbroken block directly behind it.
+    let mut blocks: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, entry) in dump.entries().iter().enumerate() {
+        let attaches = matches!(
+            entry.desc,
+            ObjectType::Comment | ObjectType::SecurityLabel | ObjectType::Acl
+        );
+        if !attaches || entry.dependencies.len() != 1 {
+            continue;
+        }
+        let Some(&(_, target)) = positions
+            .iter()
+            .find(|(id, _)| *id == entry.dependencies[0])
+        else {
+            continue;
+        };
+        blocks.entry(target).or_default().push(i);
+    }
+    assert!(
+        !blocks.is_empty(),
+        "fixture exercised no attachment entries"
+    );
+    for (target, mut attachments) in blocks {
+        attachments.sort_unstable();
+        let expected: Vec<usize> = (target + 1..=target + attachments.len()).collect();
+        assert_eq!(
+            attachments, expected,
+            "attachments of {} should occupy {expected:?}, got {order:?}",
+            order[target]
+        );
+    }
+}
+
+#[test]
+fn test_sort_orders_constraints_by_constraint_name() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    let pg_dump_names = constraint_names(&dump);
+    dump.sort_entries();
+    assert_eq!(pg_dump_names, constraint_names(&dump));
+    assert!(!pg_dump_names.is_empty(), "fixture has no constraints");
+}
+
+/// Constraint names in TOC order, with the `"<table> "` prefix removed.
+fn constraint_names(dump: &libpgdump::Dump) -> Vec<String> {
+    dump.entries()
+        .iter()
+        .filter(|e| e.desc == ObjectType::Constraint)
+        .filter_map(|e| e.tag.as_ref())
+        .map(|tag| {
+            tag.split_once(' ')
+                .map_or(tag.clone(), |(_, n)| n.to_string())
+        })
+        .collect()
 }

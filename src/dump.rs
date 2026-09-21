@@ -27,6 +27,7 @@ pub struct Dump {
     pub(crate) data: HashMap<i32, Vec<u8>>,
     pub(crate) blobs: HashMap<i32, Vec<Blob>>,
     next_dump_id: i32,
+    sort_on_save: bool,
 }
 
 impl Dump {
@@ -79,6 +80,7 @@ impl Dump {
             data: HashMap::new(),
             blobs: HashMap::new(),
             next_dump_id: 1,
+            sort_on_save: true,
         };
 
         // Add standard initial entries like pgdumplib does
@@ -128,6 +130,11 @@ impl Dump {
             data: archive.data,
             blobs: archive.blobs,
             next_dump_id,
+            // The archive was written by pg_dump (or by this library), so its
+            // TOC order is already correct.  Re-sorting it could only lose
+            // fidelity, so save() preserves it until an entry is added or
+            // modified.
+            sort_on_save: false,
         }
     }
 
@@ -184,7 +191,9 @@ impl Dump {
         let mut entries = self.entries.clone();
 
         // Sort entries using weighted topological sort (matching pg_dump)
-        sort::sort_entries(&mut entries);
+        if self.sort_on_save {
+            sort::sort_entries(&mut entries);
+        }
 
         // For directory and tar formats, ensure entries have filenames
         if self.header.format == Format::Directory || self.header.format == Format::Tar {
@@ -263,8 +272,16 @@ impl Dump {
     }
 
     /// Get a mutable reference to an entry by dump_id.
+    ///
+    /// The caller may change the entry's dependencies, so this marks the TOC
+    /// order as no longer authoritative and [`Dump::save`] will sort.  Use
+    /// [`Dump::set_sort_on_save`] to override that.
     pub fn get_entry_mut(&mut self, dump_id: i32) -> Option<&mut Entry> {
-        self.entries.iter_mut().find(|e| e.dump_id == dump_id)
+        let entry = self.entries.iter_mut().find(|e| e.dump_id == dump_id);
+        if entry.is_some() {
+            self.sort_on_save = true;
+        }
+        entry
     }
 
     /// Iterate over table data rows for the given namespace and table.
@@ -370,6 +387,9 @@ impl Dump {
     ) -> Result<i32> {
         let dump_id = self.next_dump_id;
         self.next_dump_id += 1;
+        // A new entry has no place in the loaded TOC order, so the order must
+        // be recomputed on save.
+        self.sort_on_save = true;
 
         let section = desc.section();
         let entry = Entry {
@@ -435,10 +455,29 @@ impl Dump {
     /// sort pass then reorders only as needed to satisfy the dependency graph,
     /// preserving the cosmetic ordering wherever possible.
     ///
-    /// This is called automatically by [`Dump::save`], but can also be called
-    /// manually if you need the sorted order before writing.
+    /// [`Dump::save`] calls this automatically unless the dump was loaded
+    /// from an archive and left unmodified — see [`Dump::set_sort_on_save`].
+    /// Call it directly to sort at any other time.
     pub fn sort_entries(&mut self) {
         sort::sort_entries(&mut self.entries);
+    }
+
+    /// Whether [`Dump::save`] sorts the TOC before writing.
+    ///
+    /// True for a dump built with [`Dump::new`], and for one loaded from an
+    /// archive once an entry has been added or taken mutably.  False for a
+    /// freshly loaded archive, so that a load/save round trip writes the TOC
+    /// in the order it was read.
+    pub fn sorts_on_save(&self) -> bool {
+        self.sort_on_save
+    }
+
+    /// Override whether [`Dump::save`] sorts the TOC before writing.
+    ///
+    /// Set it to false to keep the entry order exactly as given, or to true
+    /// to force a sort of a loaded archive.
+    pub fn set_sort_on_save(&mut self, sort_on_save: bool) {
+        self.sort_on_save = sort_on_save;
     }
 }
 /// Directories are always treated as directory format.
