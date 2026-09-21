@@ -11,7 +11,7 @@
 //!    satisfy dependency constraints, preserving the initial ordering wherever
 //!    possible.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::entry::Entry;
 
@@ -64,25 +64,18 @@ pub(crate) fn sort_entries(entries: &mut Vec<Entry>) {
     topo_sort(entries);
 }
 
-/// Map `dump_id` → index in `entries`, as a lookup table indexed by dump_id.
-fn build_id_to_idx(entries: &[Entry]) -> Vec<Option<usize>> {
-    let max_id = entries.iter().map(|e| e.dump_id).max().unwrap_or(0);
-    let mut id_to_idx: Vec<Option<usize>> = vec![None; (max_id.max(0) + 1) as usize];
+/// Map `dump_id` → index in `entries`.
+///
+/// Sparse, because `dump_id` values come from the archive and need not be
+/// dense or small.
+fn build_id_to_idx(entries: &[Entry]) -> HashMap<i32, usize> {
+    let mut id_to_idx = HashMap::with_capacity(entries.len());
     for (i, e) in entries.iter().enumerate() {
         if e.dump_id > 0 {
-            id_to_idx[e.dump_id as usize] = Some(i);
+            id_to_idx.insert(e.dump_id, i);
         }
     }
     id_to_idx
-}
-
-/// Resolve a dependency id to an index, ignoring ids not in the entry set.
-fn dep_idx(id_to_idx: &[Option<usize>], dep_id: i32) -> Option<usize> {
-    if dep_id > 0 && (dep_id as usize) < id_to_idx.len() {
-        id_to_idx[dep_id as usize]
-    } else {
-        None
-    }
 }
 
 /// Topologically sort `entries`, repairing dependency cycles as needed.
@@ -96,7 +89,7 @@ fn topo_sort(entries: &mut Vec<Entry>) {
         .map(|e| {
             e.dependencies
                 .iter()
-                .filter_map(|&id| dep_idx(&id_to_idx, id))
+                .filter_map(|id| id_to_idx.get(id).copied())
                 .collect()
         })
         .collect();
