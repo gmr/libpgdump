@@ -33,21 +33,93 @@ fn cmp_opt_str(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
 /// The phase-1 sort key for one entry, mirroring `DOTypeNameCompare` in
 /// pg_dump_sort.c.
 ///
-/// A COMMENT does not carry a key of its own: pg_dump writes a comment while
-/// it writes the object being commented on, so the comment lands directly
-/// after that object rather than at the priority COMMENT would otherwise
-/// give it.  Such an entry borrows the key of the entry it depends on and
-/// sorts just behind it, which no fixed value in `ObjectType::priority()`
-/// could express.
+/// A COMMENT, SECURITY LABEL or ACL does not carry a key of its own:
+/// pg_dump writes these while it writes the object they attach to, so they
+/// land directly after that object rather than at the priority their own
+/// type would give them.  Such an entry borrows the key of the entry it
+/// depends on and sorts just behind it, which no fixed value in
+/// `ObjectType::priority()` could express.
 struct SortKey {
     priority: i32,
     namespace: Option<String>,
+    /// The name pg_dump sorts on, which is not always the whole tag.
     tag: Option<String>,
     desc: ObjectType,
-    /// 0 for an entry sorting on its own key, 1 for one trailing its target.
+    /// 0 for an entry sorting on its own key, otherwise its rank behind the
+    /// target it attaches to.
     trailing: u8,
-    /// Own tag, to keep several comments on one object in a stable order.
+    /// Full tag, to keep entries that share a sort name in a stable order.
     own_tag: Option<String>,
+}
+
+/// Where an attachment sorts behind the object it describes, or `None` for
+/// an object that sorts on its own key.
+///
+/// pg_dump emits an object, then its comment, then its security label, then
+/// its ACL.
+fn trailing_rank(desc: &ObjectType) -> Option<u8> {
+    match desc {
+        ObjectType::Comment => Some(1),
+        ObjectType::SecurityLabel => Some(2),
+        ObjectType::Acl => Some(3),
+        _ => None,
+    }
+}
+
+/// Object types whose TOC tag is `"<table> <name>"`.
+///
+/// pg_dump builds these tags for display, but sorts the objects on their own
+/// name — the second part — so a constraint called `a_nn` on table `nn`
+/// sorts ahead of `bookings_pk` on table `bookings`.
+fn tag_is_table_qualified(desc: &ObjectType) -> bool {
+    matches!(
+        desc,
+        ObjectType::CheckConstraint
+            | ObjectType::Constraint
+            | ObjectType::Default
+            | ObjectType::FkConstraint
+            | ObjectType::Policy
+            | ObjectType::Rule
+            | ObjectType::Trigger
+    )
+}
+
+/// The part of a table-qualified tag that pg_dump sorts on.
+///
+/// The leading table name is written by `fmtId`, so it is double-quoted when
+/// it needs to be, with embedded quotes doubled.  A tag that does not have
+/// the expected shape is used whole.
+fn strip_table_qualifier(tag: &str) -> &str {
+    let rest = if let Some(quoted) = tag.strip_prefix('"') {
+        let mut chars = quoted.char_indices();
+        loop {
+            match chars.next() {
+                // A doubled quote is an escape, not the end of the name.
+                Some((_, '"')) if matches!(chars.clone().next(), Some((_, '"'))) => {
+                    chars.next();
+                }
+                Some((i, '"')) => break &quoted[i + 1..],
+                Some(_) => {}
+                None => return tag,
+            }
+        }
+    } else {
+        tag
+    };
+    match rest.split_once(' ') {
+        Some((_, name)) => name,
+        None => tag,
+    }
+}
+
+/// The name pg_dump sorts `entry` by.
+fn sort_name(entry: &Entry) -> Option<String> {
+    match &entry.tag {
+        Some(tag) if tag_is_table_qualified(&entry.desc) => {
+            Some(strip_table_qualifier(tag).to_string())
+        }
+        other => other.clone(),
+    }
 }
 
 impl SortKey {
@@ -55,7 +127,7 @@ impl SortKey {
         SortKey {
             priority: entry.desc.priority(),
             namespace: entry.namespace.clone(),
-            tag: entry.tag.clone(),
+            tag: sort_name(entry),
             desc: entry.desc.clone(),
             trailing: 0,
             own_tag: entry.tag.clone(),
@@ -63,9 +135,9 @@ impl SortKey {
     }
 
     /// The key that sorts `entry` directly after `target`.
-    fn trailing(entry: &Entry, target: &Entry) -> Self {
+    fn trailing(entry: &Entry, target: &Entry, rank: u8) -> Self {
         SortKey {
-            trailing: 1,
+            trailing: rank,
             own_tag: entry.tag.clone(),
             ..SortKey::own(target)
         }
@@ -88,14 +160,14 @@ fn sort_keys(entries: &[Entry]) -> Vec<SortKey> {
     entries
         .iter()
         .map(|entry| {
-            // Only a COMMENT trails its target, and only when that target is
-            // a single entry present in this archive.
-            if entry.desc == ObjectType::Comment
+            // An entry only trails its target when that target is a single
+            // entry present in this archive, and is not itself an attachment.
+            if let Some(rank) = trailing_rank(&entry.desc)
                 && let [dep_id] = entry.dependencies[..]
                 && let Some(&target) = id_to_idx.get(&dep_id)
-                && entries[target].desc != ObjectType::Comment
+                && trailing_rank(&entries[target].desc).is_none()
             {
-                SortKey::trailing(entry, &entries[target])
+                SortKey::trailing(entry, &entries[target], rank)
             } else {
                 SortKey::own(entry)
             }
@@ -456,6 +528,82 @@ mod tests {
         )];
         sort_entries(&mut entries);
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_strip_table_qualifier() {
+        assert_eq!(strip_table_qualifier("nn a_nn"), "a_nn");
+        assert_eq!(strip_table_qualifier("\"my table\" a_nn"), "a_nn");
+        assert_eq!(strip_table_qualifier("\"say \"\"hi\"\"\" ck_ok"), "ck_ok");
+        // A tag that is not table-qualified is used whole.
+        assert_eq!(strip_table_qualifier("a_nn"), "a_nn");
+        assert_eq!(strip_table_qualifier("\"unterminated"), "\"unterminated");
+    }
+
+    #[test]
+    fn test_constraints_sort_by_constraint_name() {
+        // pg_dump sorts constraints on the constraint name, not on the
+        // "<table> <constraint>" tag the archive stores.
+        let mut entries = vec![
+            make_entry(
+                1,
+                ObjectType::Constraint,
+                Some("app"),
+                Some("bookings bookings_pk"),
+                vec![],
+            ),
+            make_entry(
+                2,
+                ObjectType::Constraint,
+                Some("app"),
+                Some("nn a_nn"),
+                vec![],
+            ),
+        ];
+        sort_entries(&mut entries);
+        assert_eq!(entries[0].tag.as_deref(), Some("nn a_nn"));
+        assert_eq!(entries[1].tag.as_deref(), Some("bookings bookings_pk"));
+    }
+
+    #[test]
+    fn test_attachments_follow_their_target() {
+        // COMMENT, SECURITY LABEL and ACL sort directly behind the object
+        // they describe, in that order.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Schema, None, Some("app"), vec![]),
+            make_entry(2, ObjectType::Acl, Some(""), Some("SCHEMA app"), vec![1]),
+            make_entry(3, ObjectType::Table, Some("app"), Some("t"), vec![1]),
+            make_entry(
+                4,
+                ObjectType::Comment,
+                Some(""),
+                Some("SCHEMA app"),
+                vec![1],
+            ),
+            make_entry(
+                5,
+                ObjectType::SecurityLabel,
+                Some(""),
+                Some("SCHEMA app"),
+                vec![1],
+            ),
+        ];
+        sort_entries(&mut entries);
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        assert_eq!(ids, vec![1, 4, 5, 2, 3]);
+    }
+
+    #[test]
+    fn test_attachment_without_a_target_keeps_its_own_priority() {
+        // The commented object is not in this archive, so the comment falls
+        // back to sorting on its own type.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Comment, Some(""), Some("SCHEMA x"), vec![99]),
+            make_entry(2, ObjectType::Schema, None, Some("app"), vec![]),
+        ];
+        sort_entries(&mut entries);
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        assert_eq!(ids, vec![2, 1]);
     }
 
     #[test]

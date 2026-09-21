@@ -527,9 +527,13 @@ fn toc_order(dump: &libpgdump::Dump) -> Vec<String> {
         .collect()
 }
 
+/// A fixture every CI job generates, via `just bootstrap`.
+const FIXTURE: &str = "dump.not-compressed";
+
 #[test]
 fn test_load_save_preserves_toc_order() {
-    let Some(path) = fixture_path("pg18.custom") else {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
         return;
     };
     let dump = libpgdump::load(&path).expect("failed to load fixture");
@@ -548,7 +552,8 @@ fn test_load_save_preserves_toc_order() {
 
 #[test]
 fn test_adding_an_entry_restores_sort_on_save() {
-    let Some(path) = fixture_path("pg18.custom") else {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
         return;
     };
     let mut dump = libpgdump::load(&path).expect("failed to load fixture");
@@ -579,34 +584,91 @@ fn test_adding_an_entry_restores_sort_on_save() {
     let schema_pos = order
         .iter()
         .position(|s| s == "SCHEMA zzz")
-        .expect("missing");
+        .expect("missing schema");
     assert!(schema_pos < order.len() - 1, "got {order:?}");
 }
 
 #[test]
-fn test_sort_matches_pg_dump_prelude_and_comment_placement() {
-    let Some(path) = fixture_path("pg18.custom") else {
+fn test_sort_reproduces_pg_dump_prelude() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
         return;
     };
     let mut dump = libpgdump::load(&path).expect("failed to load fixture");
-    let pg_dump_order = toc_order(&dump);
     dump.sort_entries();
     let order = toc_order(&dump);
 
-    // pg_dump writes ENCODING, STDSTRINGS, SEARCHPATH in that order.
-    assert_eq!(&order[..3], &pg_dump_order[..3]);
     assert_eq!(order[0], "ENCODING ENCODING");
     assert_eq!(order[1], "STDSTRINGS STDSTRINGS");
     assert_eq!(order[2], "SEARCHPATH SEARCHPATH");
+}
 
-    // A COMMENT sorts directly after the object it describes.
-    let ext = order
+#[test]
+fn test_sort_places_attachments_after_their_target() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    dump.sort_entries();
+    let order = toc_order(&dump);
+
+    // Every comment, security label and ACL whose target is a single entry
+    // in this archive follows that entry immediately, as pg_dump writes it.
+    let positions: Vec<(i32, usize)> = dump
+        .entries()
         .iter()
-        .position(|s| s == "EXTENSION btree_gist")
-        .expect("missing extension");
-    assert_eq!(
-        order[ext + 1],
-        "COMMENT EXTENSION btree_gist",
-        "got {order:?}"
-    );
+        .enumerate()
+        .map(|(i, e)| (e.dump_id, i))
+        .collect();
+    let mut checked = 0;
+    for (i, entry) in dump.entries().iter().enumerate() {
+        let attaches = matches!(
+            entry.desc,
+            ObjectType::Comment | ObjectType::SecurityLabel | ObjectType::Acl
+        );
+        if !attaches || entry.dependencies.len() != 1 {
+            continue;
+        }
+        let Some(&(_, target)) = positions
+            .iter()
+            .find(|(id, _)| *id == entry.dependencies[0])
+        else {
+            continue;
+        };
+        assert!(
+            i > target && i - target <= 3,
+            "{} should follow its target {}, got {order:?}",
+            order[i],
+            order[target]
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "fixture exercised no attachment entries");
+}
+
+#[test]
+fn test_sort_orders_constraints_by_constraint_name() {
+    let Some(path) = fixture_path(FIXTURE) else {
+        eprintln!("Skipping: fixture not found. Run `just bootstrap` to generate.");
+        return;
+    };
+    let mut dump = libpgdump::load(&path).expect("failed to load fixture");
+    let pg_dump_names = constraint_names(&dump);
+    dump.sort_entries();
+    assert_eq!(pg_dump_names, constraint_names(&dump));
+    assert!(!pg_dump_names.is_empty(), "fixture has no constraints");
+}
+
+/// Constraint names in TOC order, with the `"<table> "` prefix removed.
+fn constraint_names(dump: &libpgdump::Dump) -> Vec<String> {
+    dump.entries()
+        .iter()
+        .filter(|e| e.desc == ObjectType::Constraint)
+        .filter_map(|e| e.tag.as_ref())
+        .map(|tag| {
+            tag.split_once(' ')
+                .map_or(tag.clone(), |(_, n)| n.to_string())
+        })
+        .collect()
 }
