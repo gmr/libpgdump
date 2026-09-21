@@ -11,7 +11,7 @@
 //!    satisfy dependency constraints, preserving the initial ordering wherever
 //!    possible.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::entry::Entry;
 
@@ -46,6 +46,12 @@ fn entry_cmp(a: &Entry, b: &Entry) -> std::cmp::Ordering {
 /// 1. Stable sort by type-priority / namespace / name.
 /// 2. Topological sort respecting dependencies, using a binary heap to
 ///    preserve the phase-1 ordering wherever dependencies allow.
+///
+/// If the dependency graph contains a cycle, the sort cannot place every
+/// entry.  As in pg_dump's `findDependencyLoops` / `repairDependencyLoop`,
+/// one edge of the cycle is dropped and the sort runs again, until it
+/// succeeds.  Only the sort's working copy of the dependency lists is
+/// modified; `Entry::dependencies` is left intact.
 pub(crate) fn sort_entries(entries: &mut Vec<Entry>) {
     if entries.len() <= 1 {
         return;
@@ -58,54 +64,86 @@ pub(crate) fn sort_entries(entries: &mut Vec<Entry>) {
     topo_sort(entries);
 }
 
+/// Map `dump_id` → index in `entries`.
+///
+/// Sparse, because `dump_id` values come from the archive and need not be
+/// dense or small.
+fn build_id_to_idx(entries: &[Entry]) -> HashMap<i32, usize> {
+    let mut id_to_idx = HashMap::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        if e.dump_id > 0 {
+            id_to_idx.insert(e.dump_id, i);
+        }
+    }
+    id_to_idx
+}
+
+/// Topologically sort `entries`, repairing dependency cycles as needed.
+fn topo_sort(entries: &mut Vec<Entry>) {
+    let id_to_idx = build_id_to_idx(entries);
+
+    // Working copy of the dependency graph, as indices.  Repairs drop edges
+    // from this copy, never from the entries themselves.
+    let mut deps: Vec<Vec<usize>> = entries
+        .iter()
+        .map(|e| {
+            e.dependencies
+                .iter()
+                .filter_map(|id| id_to_idx.get(id).copied())
+                .collect()
+        })
+        .collect();
+
+    let ordering = loop {
+        match try_topo_sort(&deps) {
+            Ok(ordering) => break ordering,
+            Err(unplaced) => match find_cycle_edge(&unplaced.entries, &deps) {
+                // Drop one edge of the cycle and try again.  Each repair
+                // removes an edge, so this terminates.
+                Some((from, pos)) => {
+                    deps[from].remove(pos);
+                }
+                // Unreachable in principle — entries left over by Kahn's
+                // algorithm always contain a cycle — but breaking out beats
+                // looping forever if that ever stops holding.
+                None => break unplaced.finish_appending(),
+            },
+        }
+    };
+
+    // Reorder entries according to `ordering` using moves (no cloning)
+    let mut old_entries: Vec<Option<Entry>> =
+        std::mem::take(entries).into_iter().map(Some).collect();
+    entries.extend(ordering.into_iter().map(|i| old_entries[i].take().unwrap()));
+}
+
 /// Kahn's algorithm with a max-heap, matching pg_dump's `TopoSort`.
 ///
 /// The heap ensures that, among all entries whose dependencies are satisfied,
 /// the one with the highest index in the *current* (phase-1-sorted) array is
 /// emitted first — which, when filling the output array backwards, preserves
 /// the cosmetic ordering as much as possible.
-fn topo_sort(entries: &mut Vec<Entry>) {
-    let n = entries.len();
-
-    // Build a map from dump_id → index in `entries`.
-    let max_id = entries.iter().map(|e| e.dump_id).max().unwrap_or(0);
-    if max_id <= 0 {
-        return;
-    }
-    let mut id_to_idx: Vec<Option<usize>> = vec![None; (max_id + 1) as usize];
-    for (i, e) in entries.iter().enumerate() {
-        if e.dump_id > 0 {
-            id_to_idx[e.dump_id as usize] = Some(i);
-        }
-    }
+///
+/// Returns the ordering on success, or the partial result on failure.
+fn try_topo_sort(deps: &[Vec<usize>]) -> Result<Vec<usize>, PartialOrdering> {
+    let n = deps.len();
 
     // For each entry, count how many other entries list it as a dependency
     // (i.e. how many entries must come *after* it).  pg_dump calls this
     // `beforeConstraints` — the number of constraints saying "this item
-    // must be before something else".  But it's computed by iterating each
-    // object's dependency list and incrementing the count for each dep.
+    // must be before something else".
     //
     // In pg_dump's model: entry A depends on entry B means B must come
     // before A.  So for each dep B in A.dependencies, B gets a +1 in
     // before_constraints, because B is constrained to appear before A.
-    let mut before_constraints: Vec<i32> = vec![0; (max_id + 1) as usize];
-    for e in entries.iter() {
-        for &dep_id in &e.dependencies {
-            if dep_id > 0 && (dep_id as usize) < before_constraints.len() {
-                // Only count if the dependency actually exists in our entry set
-                if id_to_idx[dep_id as usize].is_some() {
-                    before_constraints[dep_id as usize] += 1;
-                }
-            }
+    let mut before_constraints: Vec<usize> = vec![0; n];
+    for entry_deps in deps {
+        for &dep in entry_deps {
+            before_constraints[dep] += 1;
         }
     }
 
-    let mut heap = BinaryHeap::new();
-    for (i, e) in entries.iter().enumerate() {
-        if e.dump_id > 0 && before_constraints[e.dump_id as usize] == 0 {
-            heap.push(i);
-        }
-    }
+    let mut heap: BinaryHeap<usize> = (0..n).filter(|&i| before_constraints[i] == 0).collect();
 
     // Fill output backwards (highest-index first from the heap)
     let mut ordering: Vec<usize> = vec![0; n];
@@ -113,40 +151,79 @@ fn topo_sort(entries: &mut Vec<Entry>) {
     while let Some(idx) = heap.pop() {
         out_pos -= 1;
         ordering[out_pos] = idx;
-        // Decrease before_constraints for each dependency of this entry
-        let entry = &entries[idx];
-        for &dep_id in &entry.dependencies {
-            if dep_id > 0
-                && (dep_id as usize) < before_constraints.len()
-                && let Some(dep_idx) = id_to_idx[dep_id as usize]
-            {
-                before_constraints[dep_id as usize] -= 1;
-                if before_constraints[dep_id as usize] == 0 {
-                    heap.push(dep_idx);
+        for &dep in &deps[idx] {
+            before_constraints[dep] -= 1;
+            if before_constraints[dep] == 0 {
+                heap.push(dep);
+            }
+        }
+    }
+
+    if out_pos == 0 {
+        return Ok(ordering);
+    }
+
+    // Anything still carrying a before-constraint was never emitted.
+    Err(PartialOrdering {
+        placed: ordering.split_off(out_pos),
+        entries: (0..n).filter(|&i| before_constraints[i] > 0).collect(),
+    })
+}
+
+/// The result of a topological sort that hit a dependency cycle: the entries
+/// it did place, in order, and the ones it could not.
+struct PartialOrdering {
+    placed: Vec<usize>,
+    entries: Vec<usize>,
+}
+
+impl PartialOrdering {
+    /// Give up on the unplaced entries and put them at the end, where they
+    /// do the least damage: everything else keeps its section and priority
+    /// ordering, which is what decides whether the archive restores.
+    fn finish_appending(mut self) -> Vec<usize> {
+        self.placed.extend(self.entries);
+        self.placed
+    }
+}
+
+/// Find one back edge of a cycle among `unplaced`, as `(entry, position in
+/// its dependency list)`.
+///
+/// The unplaced set is closed under dependency edges — if an entry could not
+/// be placed, neither could anything it depends on — so a depth-first search
+/// starting inside it stays inside it.
+fn find_cycle_edge(unplaced: &[usize], deps: &[Vec<usize>]) -> Option<(usize, usize)> {
+    const WHITE: u8 = 0;
+    const GRAY: u8 = 1;
+    const BLACK: u8 = 2;
+
+    let mut color = vec![WHITE; deps.len()];
+    for &start in unplaced {
+        if color[start] != WHITE {
+            continue;
+        }
+        color[start] = GRAY;
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&mut (node, ref mut next)) = stack.last_mut() {
+            let Some(&child) = deps[node].get(*next) else {
+                color[node] = BLACK;
+                stack.pop();
+                continue;
+            };
+            let pos = *next;
+            *next += 1;
+            match color[child] {
+                GRAY => return Some((node, pos)),
+                WHITE => {
+                    color[child] = GRAY;
+                    stack.push((child, 0));
                 }
+                _ => {}
             }
         }
     }
-
-    // If there are dependency cycles, remaining entries weren't emitted.
-    // Append them in their original order (best-effort).
-    if out_pos > 0 {
-        let mut emitted = vec![false; n];
-        for i in out_pos..n {
-            emitted[ordering[i]] = true;
-        }
-        for (i, is_emitted) in emitted.iter().enumerate() {
-            if !is_emitted {
-                out_pos -= 1;
-                ordering[out_pos] = i;
-            }
-        }
-    }
-
-    // Reorder entries according to `ordering` using moves (no cloning)
-    let mut old_entries: Vec<Option<Entry>> =
-        std::mem::take(entries).into_iter().map(Some).collect();
-    entries.extend(ordering.into_iter().map(|i| old_entries[i].take().unwrap()));
+    None
 }
 
 #[cfg(test)]
@@ -321,5 +398,76 @@ mod tests {
         ];
         sort_entries(&mut entries);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_cycle_members_sort_after_their_schema() {
+        // Two tables that depend on each other, both in a schema they also
+        // depend on.  The cycle between them cannot be satisfied, but the
+        // schema must still come first.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Schema, None, Some("app"), vec![]),
+            make_entry(2, ObjectType::Table, Some("app"), Some("a"), vec![1, 3]),
+            make_entry(3, ObjectType::Table, Some("app"), Some("b"), vec![1, 2]),
+        ];
+        sort_entries(&mut entries);
+
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        assert_eq!(ids[0], 1, "schema must precede the cycle members: {ids:?}");
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn test_cycle_repair_keeps_dependencies_intact() {
+        // The repair pass drops edges from its own working copy only.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Table, Some("public"), Some("a"), vec![2]),
+            make_entry(2, ObjectType::Table, Some("public"), Some("b"), vec![1]),
+        ];
+        sort_entries(&mut entries);
+        for e in &entries {
+            assert_eq!(e.dependencies.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_cycle_does_not_disturb_unrelated_entries() {
+        // A cycle between two tables must not move an index that depends on
+        // one of them, nor the schema they all sit in.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Schema, None, Some("app"), vec![]),
+            make_entry(2, ObjectType::Table, Some("app"), Some("a"), vec![1, 3]),
+            make_entry(3, ObjectType::Table, Some("app"), Some("b"), vec![1, 2]),
+            make_entry(4, ObjectType::Index, Some("app"), Some("idx_a"), vec![2]),
+        ];
+        sort_entries(&mut entries);
+
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        let pos = |id: i32| ids.iter().position(|&i| i == id).unwrap();
+        assert!(pos(1) < pos(2), "{ids:?}");
+        assert!(pos(1) < pos(3), "{ids:?}");
+        assert!(pos(2) < pos(4), "{ids:?}");
+    }
+
+    #[test]
+    fn test_self_dependency_is_repaired() {
+        let mut entries = vec![
+            make_entry(1, ObjectType::Schema, None, Some("app"), vec![]),
+            make_entry(2, ObjectType::Table, Some("app"), Some("a"), vec![1, 2]),
+        ];
+        sort_entries(&mut entries);
+        let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_entries_without_dump_ids_are_placed() {
+        let mut entries = vec![
+            make_entry(0, ObjectType::Encoding, None, None, vec![]),
+            make_entry(1, ObjectType::Table, Some("app"), Some("a"), vec![]),
+        ];
+        sort_entries(&mut entries);
+        assert_eq!(entries[0].desc, ObjectType::Encoding);
+        assert_eq!(entries[1].desc, ObjectType::Table);
     }
 }
