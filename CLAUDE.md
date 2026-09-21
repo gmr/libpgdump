@@ -57,5 +57,6 @@ All three share the `ArchiveData` intermediate struct (defined in `custom.rs`) t
 - Strings: length-prefixed (pg_dump int) + UTF-8 bytes. Length -1 = NULL.
 - Version-aware parsing: fields present/absent based on archive version (1.12.0–1.16.0).
 - Object types are the `ObjectType` enum (not strings). `Entry.desc` is `ObjectType`, with `section()` and `priority()` methods. Unknown types round-trip via `ObjectType::Other(String)`.
-- TOC entries are sorted on save using weighted topological sort matching pg_dump's algorithm.
+- TOC entries are sorted on save using weighted topological sort matching pg_dump's algorithm, but only when the entry order is not already authoritative. `load()` clears the `sort_on_save` flag so a load/save round trip preserves pg_dump's TOC order; `new()`, `add_entry()` and `get_entry_mut()` set it. `set_sort_on_save()` overrides it.
+- Phase-1 sort keys mirror pg_dump's placement rather than object type alone: COMMENT, SECURITY LABEL and ACL trail the entry they describe, constraint-like entries sort on the object name rather than the `"<table> <name>"` tag, and STATISTICS DATA orders by the kind of object it describes.
 - Custom format writes use atomic rename (write to `.tmp`, rename on success) to avoid partial files.
