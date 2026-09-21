@@ -764,58 +764,93 @@ mod tests {
     #[test]
     fn test_statistics_sort_by_the_object_they_describe() {
         // pg_dump keeps statistics in one block ordered by the kind of
-        // object each describes, so a table's statistics stay with the table
-        // data while an index's are pulled down against the constraint that
-        // creates it.
+        // object each describes: every relation's statistics, then every
+        // index's.  The topological pass then pulls the index statistics
+        // down against the constraints while the relation statistics stay
+        // with the table data.
+        //
+        // Two tables are needed to tell the rule apart from a plain sort by
+        // name, which would interleave the block as a, a_pkey, b, b_pkey and
+        // drag the statistics for `b` down with those for `a_pkey`.
         let mut entries = vec![
-            make_entry(1, ObjectType::Table, Some("app"), Some("t"), vec![]),
-            make_entry(2, ObjectType::TableData, Some("app"), Some("t"), vec![1]),
-            make_entry(
-                3,
-                ObjectType::Constraint,
-                Some("app"),
-                Some("t t_pkey"),
-                vec![1],
-            ),
-            // Statistics for the index sort after those for the table even
-            // though "t_pkey" follows "t" by name in the same block.
-            make_entry(
-                4,
-                ObjectType::StatisticsData,
-                Some("app"),
-                Some("t_pkey"),
-                vec![3],
-            ),
+            make_entry(1, ObjectType::Table, Some("app"), Some("a"), vec![]),
+            make_entry(2, ObjectType::Table, Some("app"), Some("b"), vec![]),
+            make_entry(3, ObjectType::TableData, Some("app"), Some("a"), vec![1]),
+            make_entry(4, ObjectType::TableData, Some("app"), Some("b"), vec![2]),
             make_entry(
                 5,
+                ObjectType::Constraint,
+                Some("app"),
+                Some("a a_pkey"),
+                vec![1],
+            ),
+            make_entry(
+                6,
+                ObjectType::Constraint,
+                Some("app"),
+                Some("b b_pkey"),
+                vec![2],
+            ),
+            make_entry(
+                7,
                 ObjectType::StatisticsData,
                 Some("app"),
-                Some("t"),
+                Some("a"),
                 vec![1],
+            ),
+            make_entry(
+                8,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("a_pkey"),
+                vec![5],
+            ),
+            make_entry(
+                9,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("b"),
+                vec![2],
+            ),
+            make_entry(
+                10,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("b_pkey"),
+                vec![6],
             ),
         ];
         sort_entries(&mut entries);
         let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
-        assert_eq!(ids, vec![1, 2, 5, 3, 4]);
+        assert_eq!(ids, vec![1, 2, 3, 4, 7, 9, 5, 8, 6, 10]);
     }
 
     #[test]
     fn test_statistics_without_a_target_keep_their_own_priority() {
-        // The described object is not in this archive, so the statistics
-        // sort on their own type.
+        // The object described by entry 1 is not in this archive, so those
+        // statistics sort on their own type (31) and land behind the
+        // statistics for table `z`, which take the table's priority (24)
+        // even though "z" follows "a" by name.
         let mut entries = vec![
             make_entry(
                 1,
                 ObjectType::StatisticsData,
                 Some("app"),
-                Some("t"),
+                Some("a"),
                 vec![99],
             ),
-            make_entry(2, ObjectType::Table, Some("app"), Some("t"), vec![]),
+            make_entry(2, ObjectType::Table, Some("app"), Some("z"), vec![]),
+            make_entry(
+                3,
+                ObjectType::StatisticsData,
+                Some("app"),
+                Some("z"),
+                vec![2],
+            ),
         ];
         sort_entries(&mut entries);
         let ids: Vec<i32> = entries.iter().map(|e| e.dump_id).collect();
-        assert_eq!(ids, vec![2, 1]);
+        assert_eq!(ids, vec![2, 3, 1]);
     }
 
     #[test]
