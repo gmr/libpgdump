@@ -453,3 +453,68 @@ fn test_round_trip_tar_format() {
     assert_eq!(blobs[0].0, 42);
     assert_eq!(blobs[0].1, b"tar blob data");
 }
+
+#[test]
+fn test_cycle_members_sort_after_their_schema() {
+    // A declared cycle between two tables must not push them ahead of the
+    // schema they live in, nor ahead of the archive prelude.  See issue #14.
+    let mut dump = libpgdump::new("demo", "UTF8", "18.0").expect("failed to create dump");
+    let schema = dump
+        .add_entry(
+            libpgdump::ObjectType::Schema,
+            Some(""),
+            Some("app"),
+            Some("postgres"),
+            Some("CREATE SCHEMA app;\n"),
+            None,
+            None,
+            &[],
+        )
+        .expect("failed to add schema");
+    let a = dump
+        .add_entry(
+            libpgdump::ObjectType::Table,
+            Some("app"),
+            Some("a"),
+            Some("postgres"),
+            Some("CREATE TABLE app.a (id int);\n"),
+            None,
+            None,
+            &[schema],
+        )
+        .expect("failed to add table a");
+    let b = dump
+        .add_entry(
+            libpgdump::ObjectType::Table,
+            Some("app"),
+            Some("b"),
+            Some("postgres"),
+            Some("CREATE TABLE app.b (id int);\n"),
+            None,
+            None,
+            &[schema, a],
+        )
+        .expect("failed to add table b");
+    // close the loop
+    dump.get_entry_mut(a)
+        .expect("table a is missing")
+        .dependencies
+        .push(b);
+
+    dump.sort_entries();
+
+    let order: Vec<String> = dump
+        .entries()
+        .iter()
+        .map(|e| format!("{} {}", e.desc.as_str(), e.tag.clone().unwrap_or_default()))
+        .collect();
+    let pos = |needle: &str| {
+        order
+            .iter()
+            .position(|s| s == needle)
+            .unwrap_or_else(|| panic!("{needle} missing from {order:?}"))
+    };
+    assert!(pos("SCHEMA app") < pos("TABLE a"), "got {order:?}");
+    assert!(pos("SCHEMA app") < pos("TABLE b"), "got {order:?}");
+    assert!(pos("ENCODING ") < pos("SCHEMA app"), "got {order:?}");
+}
