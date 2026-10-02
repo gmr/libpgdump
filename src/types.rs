@@ -204,8 +204,14 @@ impl ObjectType {
 
     /// Sort priority matching pg_dump's `dbObjectTypePriorities`.
     /// Lower numbers sort first.  Unrecognised types get 0.
+    ///
+    /// pg_dump writes no roles or tablespaces; pg_dumpall writes them
+    /// before all other objects, roles first, so they get negative
+    /// priorities.
     pub fn priority(&self) -> i32 {
         match self {
+            Self::Group | Self::Role | Self::User => -2,
+            Self::Tablespace => -1,
             // pg_dump emits the prelude in this fixed order; they must not
             // share a priority or the name tiebreak reorders them.
             Self::Encoding => 1,
@@ -257,7 +263,7 @@ impl ObjectType {
             Self::MaterializedViewData => 47,
             Self::EventTrigger => 48,
             Self::Acl | Self::Comment | Self::SecurityLabel => 49,
-            Self::Group | Self::Role | Self::User | Self::UserMapping | Self::Tablespace => 50,
+            Self::UserMapping => 50,
             Self::Other(_) => 0,
         }
     }
