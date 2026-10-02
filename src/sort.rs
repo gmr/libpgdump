@@ -534,6 +534,35 @@ mod tests {
     }
 
     #[test]
+    fn test_sort_roles_then_tablespaces_first() {
+        // pg_dumpall makes the roles, then the tablespaces, before all
+        // other objects.
+        let mut entries = vec![
+            make_entry(1, ObjectType::Table, Some("public"), Some("t"), vec![]),
+            make_entry(2, ObjectType::Tablespace, None, Some("ts"), vec![]),
+            make_entry(3, ObjectType::Schema, None, Some("public"), vec![]),
+            make_entry(4, ObjectType::User, None, Some("u"), vec![]),
+            make_entry(5, ObjectType::Encoding, None, Some("ENCODING"), vec![]),
+            make_entry(6, ObjectType::Group, None, Some("g"), vec![]),
+            make_entry(7, ObjectType::Role, None, Some("r"), vec![]),
+        ];
+        sort_entries(&mut entries);
+        let descs: Vec<&ObjectType> = entries.iter().map(|e| &e.desc).collect();
+        assert_eq!(
+            descs,
+            vec![
+                &ObjectType::Group,
+                &ObjectType::Role,
+                &ObjectType::User,
+                &ObjectType::Tablespace,
+                &ObjectType::Encoding,
+                &ObjectType::Schema,
+                &ObjectType::Table,
+            ]
+        );
+    }
+
+    #[test]
     fn test_sort_respects_dependencies() {
         // Table depends on schema, index depends on table
         let mut entries = vec![
